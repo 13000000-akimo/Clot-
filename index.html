@@ -1,0 +1,1482 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Уборщик</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Уборщик">
+<meta name="theme-color" content="#0b0d12">
+<meta name="format-detection" content="telephone=no">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; background:#0b0d12; overflow:hidden;
+    overscroll-behavior:none; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none;
+    -webkit-tap-highlight-color:transparent; touch-action:none; position:fixed; inset:0; }
+  canvas { position:fixed; left:0; top:0; width:100%; height:100%; display:block; touch-action:none; }
+  #probe { position:fixed; left:0; top:0; visibility:hidden; pointer-events:none;
+    padding-top:env(safe-area-inset-top); padding-bottom:env(safe-area-inset-bottom);
+    padding-left:env(safe-area-inset-left); padding-right:env(safe-area-inset-right); }
+</style>
+</head>
+<body>
+<div id="probe"></div>
+<canvas id="game"></canvas>
+<script>
+'use strict';
+/* =====================================================================
+ *  УБОРЩИК — 2D top-down игра для iPhone (Canvas + Web Audio, без библиотек)
+ *
+ *  Структура файла:
+ *   1. Утилиты и константы
+ *   2. Save      — сохранение в localStorage
+ *   3. Sfx       — процедурный звук (Web Audio)
+ *   4. Level     — геометрия уровня (стены, мебель, комнаты) + 2 уровня:
+ *                  makeApartment() и makePrecinct()
+ *   5. Рисование статики (пол, мебель) и иконок
+ *   6. Сущности: Player, Body, Stain, Rat, Bucket, Sponge, Officer
+ *   7. Game      — состояния (menu → game → station → report), ввод, UI
+ * ===================================================================== */
+(() => {
+
+/* ---------------------------------------------------------------- 1. УТИЛИТЫ */
+const SHIFT_SECONDS = 480;      // длина смены в реальных секундах (22:00 → 06:00)
+const BAG_TIME = 3;             // сколько секунд держать, чтобы упаковать тело
+const DELETE_TIME = 2.2;        // сколько секунд удалять одну запись в участке
+const SAVE_KEY = 'cleaner_save_v1';
+const FONT = '-apple-system, "SF Pro Text", Helvetica, Arial, sans-serif';
+
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const rnd = (a, b) => a + Math.random() * (b - a);
+const rndi = (a, b) => Math.floor(rnd(a, b + 1));
+const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+const lerp = (a, b, t) => a + (b - a) * t;
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+// Детерминированный генератор — чтобы пятна и пол выглядели одинаково после загрузки
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+// Расстояние от точки до прямоугольника (0 — если внутри)
+function rectDist(px, py, r) { const dx = Math.max(r.x - px, 0, px - (r.x + r.w)); const dy = Math.max(r.y - py, 0, py - (r.y + r.h)); return Math.hypot(dx, dy); }
+function aabb(a, b) { return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
+function rr(c, x, y, w, h, r) { r = Math.min(r, w / 2, h / 2); c.beginPath(); c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r); c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath(); }
+function angDiff(a, b) { let d = a - b; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; }
+
+const NAMES = ['Орлов А.', 'Смирнова Е.', 'Кузнецов Д.', 'Лебедева М.', 'Волков И.', 'Морозова Т.', 'Новиков С.', 'Соколов П.', 'Попова Н.', 'Фёдоров Г.', 'Захарова О.', 'Белов В.', 'Крылова Л.', 'Тихонов Р.'];
+
+/* ---------------------------------------------------------------- 2. СОХРАНЕНИЕ */
+const Save = {
+  data: { money: 0, day: 1, best: 0, shifts: 0, muted: false, shift: null },
+  load() { try { const s = localStorage.getItem(SAVE_KEY); if (s) Object.assign(this.data, JSON.parse(s)); } catch (e) { /* приватный режим и т.п. */ } },
+  write() { try { localStorage.setItem(SAVE_KEY, JSON.stringify(this.data)); } catch (e) { } }
+};
+
+/* ---------------------------------------------------------------- 3. ЗВУК */
+class Sfx {
+  constructor() { this.ctx = null; this.master = null; this.nb = null; this.muted = false; }
+  // AudioContext на iOS можно создать только внутри жеста пользователя
+  unlock() {
+    if (!this.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+      try { this.ctx = new AC(); } catch (e) { return; }
+      this.master = this.ctx.createGain(); this.master.gain.value = this.muted ? 0 : 0.8; this.master.connect(this.ctx.destination);
+      const sr = this.ctx.sampleRate, buf = this.ctx.createBuffer(1, sr, sr), d = buf.getChannelData(0);
+      for (let i = 0; i < sr; i++) d[i] = Math.random() * 2 - 1;   // 1 сек белого шума — база для шагов, воды, швабры
+      this.nb = buf;
+    }
+    if (this.ctx.state !== 'running' && this.ctx.resume) this.ctx.resume();
+  }
+  setMuted(m) { this.muted = m; if (this.master) this.master.gain.value = m ? 0 : 0.8; }
+  _env(g, t, a, d, v) { g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(v, t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); }
+  tone(f0, f1, dur, type, vol, delay) {
+    if (!this.ctx) return; const c = this.ctx, t = c.currentTime + (delay || 0);
+    const o = c.createOscillator(), g = c.createGain(); o.type = type || 'sine';
+    o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+    this._env(g, t, 0.005, dur, vol || 0.2); o.connect(g); g.connect(this.master); o.start(t); o.stop(t + dur + 0.05);
+  }
+  noise(dur, f0, f1, q, vol, type, delay) {
+    if (!this.ctx || !this.nb) return; const c = this.ctx, t = c.currentTime + (delay || 0);
+    const s = c.createBufferSource(); s.buffer = this.nb;
+    const f = c.createBiquadFilter(); f.type = type || 'bandpass'; f.Q.value = q || 1;
+    f.frequency.setValueAtTime(f0, t); f.frequency.linearRampToValueAtTime(f1, t + dur);
+    const g = c.createGain(); this._env(g, t, 0.01, dur, vol || 0.1);
+    s.connect(f); f.connect(g); g.connect(this.master); s.start(t, Math.random() * (1 - dur - 0.05)); s.stop(t + dur + 0.05);
+  }
+  step() { this.noise(0.07, 260 + Math.random() * 100, 180, 0.8, 0.10, 'lowpass'); }
+  mop() { this.noise(0.28, 700, 1400, 1.2, 0.10, 'bandpass'); }
+  water() { this.noise(0.35, 1500, 2600, 0.9, 0.09, 'bandpass'); this.tone(500 + Math.random() * 400, 900, 0.06, 'sine', 0.04); }
+  squeak() { this.tone(1800, 3000, 0.07, 'square', 0.06); this.tone(3000, 1700, 0.10, 'square', 0.05, 0.07); }
+  photo() { this.noise(0.04, 6000, 6000, 0.5, 0.15, 'highpass'); this.tone(1400, 900, 0.05, 'square', 0.08, 0.03); this.tone(500, 300, 0.1, 'square', 0.06, 0.08); }
+  pickup() { this.tone(500, 800, 0.08, 'triangle', 0.15); }
+  drop() { this.tone(200, 90, 0.18, 'sine', 0.25); this.noise(0.1, 200, 100, 1, 0.1, 'lowpass'); }
+  rustle() { this.noise(0.4, 3000, 1500, 0.6, 0.07, 'highpass'); }
+  thud() { this.tone(120, 40, 0.35, 'sine', 0.35); this.noise(0.2, 150, 80, 1, 0.2, 'lowpass'); }
+  err() { this.tone(190, 130, 0.2, 'sawtooth', 0.08); }
+  ok() { this.tone(660, 660, 0.08, 'triangle', 0.15); this.tone(880, 880, 0.1, 'triangle', 0.15, 0.09); this.tone(1320, 1320, 0.14, 'triangle', 0.13, 0.19); }
+  key() { this.tone(1500 + Math.random() * 300, 1500, 0.03, 'square', 0.04); }
+  alarm() { this.tone(900, 600, 0.25, 'square', 0.08); this.tone(900, 600, 0.25, 'square', 0.08, 0.28); }
+  splat() { this.noise(0.15, 500, 200, 1, 0.14, 'lowpass'); this.squeak(); }
+}
+
+/* ---------------------------------------------------------------- 4. УРОВНИ */
+class Level {
+  constructor(name, w, h) {
+    this.name = name; this.w = w; this.h = h;
+    this.rooms = []; this.walls = []; this.furn = []; this.solids = [];
+    this.sources = []; this.bottles = [];
+    this.cache = null; this.cacheScale = 0;
+  }
+  addWall(x, y, w, h) { this.walls.push({ x, y, w, h }); }
+  addFurn(type, x, y, w, h, solid) { const f = { type, x, y, w, h, solid: solid !== false }; this.furn.push(f); return f; }
+  finalize() { this.solids = this.walls.concat(this.furn.filter(f => f.solid)); }
+  roomAt(x, y) { for (const r of this.rooms) if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) return r; return null; }
+}
+
+/* Данные для генерации смены */
+const BODY_SPOTS = [
+  { x: 88, y: 580, o: 'v', bed: true },
+  { x: 330, y: 130, o: 'h' }, { x: 250, y: 280, o: 'h' }, { x: 800, y: 250, o: 'h' }, { x: 580, y: 250, o: 'v' },
+  { x: 300, y: 392, o: 'h' }, { x: 480, y: 600, o: 'v' }, { x: 760, y: 540, o: 'h' }, { x: 700, y: 690, o: 'h' }, { x: 240, y: 620, o: 'v' }
+];
+const FLOOR_SPOTS = [
+  { x: 120, y: 250 }, { x: 400, y: 290 }, { x: 200, y: 180 }, { x: 700, y: 300 }, { x: 880, y: 290 }, { x: 560, y: 150 },
+  { x: 200, y: 395 }, { x: 780, y: 395 }, { x: 420, y: 402 }, { x: 200, y: 560 }, { x: 400, y: 610 }, { x: 500, y: 660 },
+  { x: 680, y: 540 }, { x: 880, y: 680 }, { x: 800, y: 600 }
+];
+const WALL_SPOTS = [
+  { x: 250, y: 24, dir: 'top' }, { x: 24, y: 200, dir: 'left' }, { x: 780, y: 328, dir: 'bottom' }, { x: 936, y: 290, dir: 'right' },
+  { x: 260, y: 426, dir: 'bottom' }, { x: 600, y: 358, dir: 'top' }, { x: 22, y: 692, dir: 'left' }, { x: 200, y: 778, dir: 'bottom' },
+  { x: 570, y: 650, dir: 'right' }, { x: 900, y: 778, dir: 'bottom' }
+];
+const CEIL_SPOTS = [
+  { x: 240, y: 260 }, { x: 600, y: 250 }, { x: 480, y: 392 }, { x: 240, y: 560 }, { x: 480, y: 640 }, { x: 780, y: 520 }, { x: 420, y: 150 }
+];
+
+function makeApartment() {
+  const L = new Level('apartment', 1040, 800);
+  // Комнаты (пол + затемнённость: 0 — светло, 0.9 — почти тьма, нужен фонарик)
+  L.rooms = [
+    { id: 'living', name: 'Гостиная', x: 16, y: 16, w: 480, h: 320, floor: 'wood', dark: 0 },
+    { id: 'kitchen', name: 'Кухня', x: 512, y: 16, w: 432, h: 320, floor: 'tile', dark: 0 },
+    { id: 'hall', name: 'Коридор', x: 16, y: 352, w: 928, h: 80, floor: 'carpet', dark: 0.35 },
+    { id: 'bed', name: 'Спальня', x: 16, y: 448, w: 320, h: 336, floor: 'wood2', dark: 0.92 },
+    { id: 'bath', name: 'Ванная', x: 352, y: 448, w: 224, h: 336, floor: 'tile2', dark: 0 },
+    { id: 'store', name: 'Кладовая', x: 592, y: 448, w: 352, h: 336, floor: 'concrete', dark: 0.92 },
+    { id: 'yard', name: 'Двор', x: 960, y: 0, w: 80, h: 800, floor: 'asphalt', dark: 0.55 }
+  ];
+  const W = (x, y, w, h) => L.addWall(x, y, w, h);
+  W(0, 0, 960, 16); W(0, 784, 960, 16); W(0, 0, 16, 800);          // внешние стены
+  W(944, 0, 16, 352); W(944, 432, 16, 368);                          // правая стена с проёмом в коридоре (выход во двор)
+  W(960, 0, 80, 16); W(960, 784, 80, 16);                            // забор двора
+  W(496, 16, 16, 120); W(496, 200, 16, 136);                         // гостиная | кухня (проём 136..200)
+  W(16, 336, 160, 16); W(240, 336, 480, 16); W(784, 336, 160, 16);   // верхний ряд | коридор (двери 176..240, 720..784)
+  W(16, 432, 80, 16); W(160, 432, 272, 16); W(496, 432, 244, 16); W(804, 432, 140, 16); // коридор | нижний ряд
+  W(336, 448, 16, 120); W(336, 632, 16, 152);                        // спальня | ванная (проём 568..632)
+  W(576, 448, 16, 100); W(576, 612, 16, 172);                        // ванная | кладовая (проём 548..612)
+
+  // --- Гостиная
+  L.addFurn('sofa', 40, 32, 150, 56); L.addFurn('table', 64, 128, 96, 48); L.addFurn('tv', 290, 24, 150, 32);
+  L.addFurn('shelf', 448, 60, 40, 70); L.addFurn('armchair', 320, 200, 48, 48); L.addFurn('plant', 44, 284, 28, 28);
+  // --- Кухня
+  L.addFurn('counter', 528, 26, 320, 40); L.addFurn('sink', 600, 26, 56, 40, false);
+  L.addFurn('fridge', 856, 26, 56, 60); L.addFurn('table', 650, 150, 110, 72); L.addFurn('cabinet', 908, 120, 28, 120);
+  // --- Коридор
+  L.addFurn('cabinet', 100, 356, 70, 22); L.addFurn('bench', 420, 356, 90, 22); L.addFurn('box', 640, 404, 36, 22);
+  L.addFurn('plant', 24, 358, 22, 22);
+  L.bagStack = L.addFurn('bags', 872, 356, 44, 26);
+  // --- Спальня
+  L.addFurn('bed', 32, 500, 112, 160); L.addFurn('nightstand', 150, 500, 30, 30); L.addFurn('wardrobe', 230, 462, 90, 44);
+  L.addFurn('dresser', 32, 728, 130, 40); L.addFurn('box', 262, 716, 56, 50);
+  L.bed = { x: 32, y: 500, w: 112, h: 160 };
+  // --- Ванная
+  L.addFurn('tub', 366, 466, 70, 92); L.addFurn('basin', 452, 462, 52, 34); L.addFurn('toilet', 524, 470, 40, 46); L.addFurn('cabinet', 516, 700, 52, 66);
+  // --- Кладовая
+  L.addFurn('shelfL', 608, 462, 120, 26); L.addFurn('shelfL', 816, 462, 100, 26);
+  L.addFurn('box', 620, 570, 50, 50); L.addFurn('box', 700, 610, 60, 50); L.addFurn('crate', 860, 520, 64, 64);
+  L.addFurn('barrel', 830, 690, 40, 40); L.addFurn('workbench', 620, 736, 160, 34); L.addFurn('utilsink', 904, 590, 32, 44);
+  // --- Машина во дворе
+  L.van = L.addFurn('van', 1000, 300, 36, 170);
+
+  // Источники воды (раковины/ванна): сюда можно набирать воду и сюда же сливать
+  L.sources = [
+    { x: 600, y: 26, w: 56, h: 40, name: 'раковина' }, { x: 452, y: 462, w: 52, h: 34, name: 'раковина' },
+    { x: 366, y: 466, w: 70, h: 92, name: 'ванна' }, { x: 904, y: 590, w: 32, h: 44, name: 'кран' }
+  ];
+  // Бутылки со средствами
+  L.bottles = [
+    { x: 730, y: 46, type: 'soap' }, { x: 542, y: 712, type: 'soap' }, { x: 690, y: 748, type: 'chlor' }, { x: 658, y: 414, type: 'chlor' }
+  ];
+  L.start = { x: 985, y: 392 };
+  L.finalize();
+  return L;
+}
+
+function makePrecinct() {
+  const L = new Level('station', 480, 640);
+  L.rooms = [{ id: 'lobby', name: 'Участок', x: 16, y: 16, w: 448, h: 608, floor: 'tile3', dark: 0.4 }];
+  L.addWall(0, 0, 480, 16); L.addWall(0, 624, 200, 16); L.addWall(280, 624, 200, 16); L.addWall(0, 0, 16, 640); L.addWall(464, 0, 16, 640);
+  L.addFurn('desk', 60, 200, 110, 50); L.addFurn('desk', 310, 200, 110, 50);
+  L.addFurn('desk', 60, 400, 110, 50); L.addFurn('desk', 310, 400, 110, 50);
+  L.terminal = L.addFurn('terminal', 190, 36, 100, 50);
+  L.addFurn('cell', 16, 16, 110, 100); L.addFurn('cabinet', 400, 30, 50, 80);
+  L.addFurn('plant', 430, 580, 28, 28); L.addFurn('bench', 24, 560, 90, 24); L.addFurn('box', 370, 556, 60, 40);
+  L.exitZone = { x: 200, y: 596, w: 80, h: 44 };
+  L.start = { x: 240, y: 585 };
+  L.patrol = [{ x: 240, y: 150 }, { x: 140, y: 310 }, { x: 240, y: 490 }, { x: 340, y: 310 }];
+  L.finalize();
+  return L;
+}
+
+/* ---------------------------------------------------------------- 5. РИСОВАНИЕ СТАТИКИ */
+function drawFloor(c, r, rng) {
+  c.save(); c.beginPath(); c.rect(r.x, r.y, r.w, r.h); c.clip();
+  switch (r.floor) {
+    case 'wood': case 'wood2': {
+      const b = r.floor === 'wood' ? [122, 82, 51] : [84, 62, 48];
+      c.fillStyle = `rgb(${b[0]},${b[1]},${b[2]})`; c.fillRect(r.x, r.y, r.w, r.h);
+      const ph = 16;
+      for (let y = r.y, row = 0; y < r.y + r.h; y += ph, row++) {
+        let x = r.x - (row % 2) * 30;
+        while (x < r.x + r.w) {
+          const pw = 60 + Math.floor(rng() * 3) * 14, v = Math.floor(rng() * 14) - 7;
+          c.fillStyle = `rgb(${b[0] + v},${b[1] + v},${b[2] + v})`; c.fillRect(x + 1, y + 1, pw - 2, ph - 2); x += pw;
+        }
+      }
+      break;
+    }
+    case 'tile': case 'tile2': case 'tile3': {
+      const col = { tile: ['#cfcabb', '#b3ae9f', 32], tile2: ['#9fc3c9', '#7fa3a9', 24], tile3: ['#7e8791', '#626a73', 32] }[r.floor];
+      c.fillStyle = col[0]; c.fillRect(r.x, r.y, r.w, r.h);
+      const s = col[2];
+      for (let x = r.x, i = 0; x < r.x + r.w; x += s, i++) for (let y = r.y, j = 0; y < r.y + r.h; y += s, j++) if ((i + j) % 2) { c.fillStyle = 'rgba(0,0,0,0.05)'; c.fillRect(x, y, s, s); }
+      c.fillStyle = col[1];
+      for (let x = r.x; x < r.x + r.w; x += s) c.fillRect(x, r.y, 1.5, r.h);
+      for (let y = r.y; y < r.y + r.h; y += s) c.fillRect(r.x, y, r.w, 1.5);
+      break;
+    }
+    case 'carpet': {
+      c.fillStyle = '#4a3342'; c.fillRect(r.x, r.y, r.w, r.h);
+      for (let i = 0; i < 700; i++) { c.fillStyle = rng() < 0.5 ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.08)'; c.fillRect(r.x + rng() * r.w, r.y + rng() * r.h, 2, 2); }
+      c.fillStyle = '#6b4a5c'; c.fillRect(r.x, r.y + r.h / 2 - 2, r.w, 4);
+      break;
+    }
+    case 'concrete': {
+      c.fillStyle = '#5a5c61'; c.fillRect(r.x, r.y, r.w, r.h);
+      for (let i = 0; i < 900; i++) { c.fillStyle = rng() < 0.5 ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.12)'; c.fillRect(r.x + rng() * r.w, r.y + rng() * r.h, 2, 2); }
+      c.strokeStyle = 'rgba(0,0,0,0.25)'; c.lineWidth = 1; c.beginPath();
+      for (let k = 0; k < 4; k++) { let x = r.x + rng() * r.w, y = r.y + rng() * r.h; c.moveTo(x, y); for (let s = 0; s < 5; s++) { x += rng() * 30 - 15; y += rng() * 30 - 5; c.lineTo(x, y); } }
+      c.stroke();
+      break;
+    }
+    case 'asphalt': {
+      c.fillStyle = '#22252a'; c.fillRect(r.x, r.y, r.w, r.h);
+      for (let i = 0; i < 300; i++) { c.fillStyle = 'rgba(255,255,255,0.04)'; c.fillRect(r.x + rng() * r.w, r.y + rng() * r.h, 2, 2); }
+      c.strokeStyle = 'rgba(230,230,200,0.25)'; c.lineWidth = 3; c.setLineDash([22, 18]);
+      c.beginPath(); c.moveTo(r.x + 8, r.y); c.lineTo(r.x + 8, r.y + r.h); c.stroke(); c.setLineDash([]);
+      break;
+    }
+  }
+  c.restore();
+}
+
+// Базовый «ящик» с тенью, подсветкой сверху и обводкой
+function box(c, f, col, rad) {
+  c.fillStyle = 'rgba(0,0,0,0.28)'; rr(c, f.x + 3, f.y + 4, f.w, f.h, rad || 4); c.fill();
+  c.fillStyle = col; rr(c, f.x, f.y, f.w, f.h, rad || 4); c.fill();
+  c.strokeStyle = 'rgba(0,0,0,0.45)'; c.lineWidth = 1.5; c.stroke();
+  c.fillStyle = 'rgba(255,255,255,0.12)'; rr(c, f.x + 2, f.y + 2, f.w - 4, Math.min(5, f.h / 3), 2); c.fill();
+}
+
+function drawFurn(c, f) {
+  const x = f.x, y = f.y, w = f.w, h = f.h;
+  switch (f.type) {
+    case 'sofa': {
+      box(c, f, '#7a2f3a', 8); c.fillStyle = '#5c2029'; rr(c, x + 2, y + 2, w - 4, 14, 5); c.fill();
+      c.fillStyle = '#93404c'; const n = 3, cw = (w - 20) / n;
+      for (let i = 0; i < n; i++) { rr(c, x + 10 + i * cw + 1, y + 18, cw - 2, h - 24, 4); c.fill(); }
+      break;
+    }
+    case 'armchair': box(c, f, '#2f5d62', 10); c.fillStyle = '#244a4e'; rr(c, x + 4, y + 3, w - 8, 12, 4); c.fill(); c.fillStyle = '#3c747a'; rr(c, x + 8, y + 18, w - 16, h - 24, 5); c.fill(); break;
+    case 'table': box(c, f, '#8a6a43', 5); c.strokeStyle = 'rgba(0,0,0,0.18)'; c.lineWidth = 1; for (let i = 1; i < 4; i++) { c.beginPath(); c.moveTo(x + 4, y + i * h / 4); c.lineTo(x + w - 4, y + i * h / 4); c.stroke(); } break;
+    case 'tv': box(c, f, '#2a2d34', 3); c.fillStyle = '#10141a'; rr(c, x + 18, y + 4, w - 36, h - 10, 2); c.fill(); c.fillStyle = 'rgba(120,170,255,0.18)'; rr(c, x + 22, y + 7, w - 44, 6, 2); c.fill(); break;
+    case 'shelf': case 'shelfL': {
+      box(c, f, '#5b4128', 3); const horiz = w > h; const cols = ['#a33', '#37a', '#3a5', '#cb3', '#85a', '#c73'];
+      const n = Math.floor((horiz ? w : h) / 10);
+      for (let i = 0; i < n; i++) { c.fillStyle = cols[i % cols.length]; if (horiz) c.fillRect(x + 4 + i * 10, y + 5, 7, h - 10); else c.fillRect(x + 5, y + 4 + i * 10, w - 10, 7); }
+      break;
+    }
+    case 'plant': {
+      c.fillStyle = 'rgba(0,0,0,0.25)'; c.beginPath(); c.ellipse(x + w / 2 + 2, y + h / 2 + 3, w / 2, h / 2, 0, 0, 7); c.fill();
+      c.fillStyle = '#7a4a2a'; c.beginPath(); c.arc(x + w / 2, y + h / 2, w / 2 - 2, 0, 7); c.fill();
+      c.fillStyle = '#2f8a3f'; for (let i = 0; i < 7; i++) { const a = i * 0.9; c.beginPath(); c.ellipse(x + w / 2 + Math.cos(a) * 5, y + h / 2 + Math.sin(a) * 5, 6, 3.5, a, 0, 7); c.fill(); }
+      c.fillStyle = '#48b25b'; c.beginPath(); c.arc(x + w / 2, y + h / 2, 3, 0, 7); c.fill();
+      break;
+    }
+    case 'counter': box(c, f, '#cfc7b6', 3); c.fillStyle = '#9b9484'; c.fillRect(x + 4, y + h - 8, w - 8, 3);
+      c.fillStyle = '#3a3a3a'; for (let i = 0; i < 4; i++) { c.beginPath(); c.arc(x + 200 + (i % 2) * 22, y + 12 + Math.floor(i / 2) * 18, 7, 0, 7); c.fill(); } break;
+    case 'sink': c.fillStyle = '#b8c4cc'; rr(c, x, y, w, h, 4); c.fill(); c.fillStyle = '#7fa8c0'; rr(c, x + 5, y + 6, w - 10, h - 12, 6); c.fill(); c.fillStyle = '#d0d6da'; c.fillRect(x + w / 2 - 2, y + 2, 4, 9); break;
+    case 'basin': box(c, f, '#e6ecef', 8); c.fillStyle = '#9fc6d6'; c.beginPath(); c.ellipse(x + w / 2, y + h / 2 + 2, w / 2 - 9, h / 2 - 7, 0, 0, 7); c.fill(); c.fillStyle = '#9aa'; c.fillRect(x + w / 2 - 2, y + 2, 4, 8); break;
+    case 'fridge': box(c, f, '#d5dadd', 5); c.fillStyle = '#a9b0b5'; c.fillRect(x + 4, y + h / 2 - 1, w - 8, 2); c.fillStyle = '#777'; c.fillRect(x + w - 9, y + 8, 3, 14); break;
+    case 'cabinet': box(c, f, '#6e5538', 3); c.strokeStyle = 'rgba(0,0,0,0.3)'; c.lineWidth = 1; if (w > h) { c.beginPath(); c.moveTo(x + w / 2, y + 2); c.lineTo(x + w / 2, y + h - 2); c.stroke(); } else { c.beginPath(); c.moveTo(x + 2, y + h / 2); c.lineTo(x + w - 2, y + h / 2); c.stroke(); } break;
+    case 'bench': box(c, f, '#7b5c3a', 3); break;
+    case 'box': box(c, f, '#a8814f', 2); c.strokeStyle = 'rgba(0,0,0,0.3)'; c.beginPath(); c.moveTo(x + 2, y + 2); c.lineTo(x + w - 2, y + h - 2); c.moveTo(x + w - 2, y + 2); c.lineTo(x + 2, y + h - 2); c.stroke(); break;
+    case 'crate': box(c, f, '#8b6a3e', 2); c.strokeStyle = 'rgba(0,0,0,0.35)'; c.lineWidth = 2; c.strokeRect(x + 5, y + 5, w - 10, h - 10); c.beginPath(); c.moveTo(x + 5, y + 5); c.lineTo(x + w - 5, y + h - 5); c.stroke(); break;
+    case 'barrel': c.fillStyle = 'rgba(0,0,0,0.3)'; c.beginPath(); c.arc(x + w / 2 + 3, y + h / 2 + 4, w / 2, 0, 7); c.fill();
+      c.fillStyle = '#2f5a8a'; c.beginPath(); c.arc(x + w / 2, y + h / 2, w / 2, 0, 7); c.fill(); c.strokeStyle = '#1d3b5c'; c.lineWidth = 3; c.beginPath(); c.arc(x + w / 2, y + h / 2, w / 2 - 4, 0, 7); c.stroke();
+      c.fillStyle = '#9ec0e0'; c.beginPath(); c.arc(x + w / 2, y + h / 2, 5, 0, 7); c.fill(); break;
+    case 'workbench': box(c, f, '#6a5a44', 3); c.fillStyle = '#4a3d2c'; c.fillRect(x + 4, y + h - 8, w - 8, 3); break;
+    case 'utilsink': box(c, f, '#9aa2a8', 4); c.fillStyle = '#6e8fa2'; rr(c, x + 5, y + 8, w - 10, h - 16, 4); c.fill(); c.fillStyle = '#ccc'; c.fillRect(x + w - 8, y + 3, 6, 6); break;
+    case 'bed': {
+      box(c, f, '#4a3a2c', 5); c.fillStyle = '#c9c3b6'; rr(c, x + 5, y + 5, w - 10, h - 10, 5); c.fill();
+      c.fillStyle = '#f0ede6'; rr(c, x + 10, y + 9, w - 20, 26, 8); c.fill();               // подушка
+      c.fillStyle = '#4b6aa0'; rr(c, x + 5, y + 50, w - 10, h - 55, 5); c.fill();             // одеяло
+      c.fillStyle = 'rgba(255,255,255,0.12)'; c.fillRect(x + 8, y + 54, w - 16, 4); break;
+    }
+    case 'nightstand': box(c, f, '#6d4f33', 3); c.fillStyle = '#e8d9a0'; c.beginPath(); c.arc(x + w / 2, y + h / 2, 5, 0, 7); c.fill(); break;
+    case 'wardrobe': box(c, f, '#5d4630', 3); c.strokeStyle = 'rgba(0,0,0,0.35)'; c.beginPath(); c.moveTo(x + w / 2, y + 2); c.lineTo(x + w / 2, y + h - 2); c.stroke(); break;
+    case 'dresser': box(c, f, '#7a5a38', 3); c.strokeStyle = 'rgba(0,0,0,0.3)'; for (let i = 1; i < 4; i++) { c.beginPath(); c.moveTo(x + i * w / 4, y + 3); c.lineTo(x + i * w / 4, y + h - 3); c.stroke(); } break;
+    case 'tub': {
+      box(c, f, '#e8eef1', 12); c.fillStyle = '#9fd0e4'; rr(c, x + 6, y + 14, w - 12, h - 20, 14); c.fill();
+      c.fillStyle = 'rgba(255,255,255,0.35)'; rr(c, x + 10, y + 18, 10, h - 30, 5); c.fill(); c.fillStyle = '#9aa'; c.fillRect(x + w / 2 - 2, y + 3, 4, 9); break;
+    }
+    case 'toilet': box(c, f, '#e8eef1', 6); c.fillStyle = '#cfd8dc'; c.beginPath(); c.ellipse(x + w / 2, y + h * 0.65, w / 2 - 6, h / 2 - 8, 0, 0, 7); c.fill(); c.fillStyle = '#b9c4ca'; rr(c, x + 5, y + 3, w - 10, 12, 3); c.fill(); break;
+    case 'bags': {
+      for (let i = 0; i < 4; i++) { c.fillStyle = i % 2 ? '#8b9097' : '#9aa0a8'; rr(c, x + (i % 2) * 20, y + Math.floor(i / 2) * 12, 24, 14, 5); c.fill(); c.strokeStyle = 'rgba(0,0,0,0.4)'; c.stroke(); }
+      c.fillStyle = '#ffd24a'; c.font = `bold 9px ${FONT}`; c.textAlign = 'center'; c.fillText('МЕШКИ', x + w / 2, y - 3); break;
+    }
+    case 'van': {
+      c.fillStyle = 'rgba(0,0,0,0.35)'; rr(c, x + 4, y + 5, w, h, 8); c.fill();
+      c.fillStyle = '#d8dce0'; rr(c, x, y, w, h, 8); c.fill(); c.strokeStyle = '#555'; c.lineWidth = 2; c.stroke();
+      c.fillStyle = '#6aa0c8'; rr(c, x + 4, y + h - 40, w - 8, 30, 5); c.fill();         // лобовое стекло
+      c.fillStyle = '#b5babf'; c.fillRect(x + 4, y + 10, w - 8, h - 62);                   // крыша
+      c.fillStyle = '#c33'; c.font = `bold 10px ${FONT}`; c.save(); c.translate(x + w / 2 + 3, y + 70); c.rotate(-Math.PI / 2); c.textAlign = 'center'; c.fillText('CLEAN-UP', 0, 0); c.restore();
+      c.fillStyle = '#ffd24a'; c.beginPath(); c.arc(x + 6, y + h - 4, 3, 0, 7); c.arc(x + w - 6, y + h - 4, 3, 0, 7); c.fill();
+      c.strokeStyle = 'rgba(255,210,74,0.8)'; c.setLineDash([5, 4]); c.strokeRect(x - 40, y + 30, 40, 110); c.setLineDash([]);   // зона погрузки
+      c.fillStyle = 'rgba(255,210,74,0.9)'; c.font = `bold 9px ${FONT}`; c.save(); c.translate(x - 20, y + 85); c.rotate(-Math.PI / 2); c.textAlign = 'center'; c.fillText('ЗАГРУЗКА', 0, 3); c.restore();
+      break;
+    }
+    case 'desk': box(c, f, '#7d6a52', 3); c.fillStyle = '#2a2d34'; rr(c, x + 10, y + 8, 30, 20, 2); c.fill(); c.fillStyle = '#dcdcc8'; c.fillRect(x + w - 40, y + 12, 26, 18); break;
+    case 'terminal': {
+      box(c, f, '#4d5560', 3); c.fillStyle = '#0a1a0f'; rr(c, x + 14, y + 6, w - 28, 26, 3); c.fill();
+      c.fillStyle = 'rgba(80,255,140,0.55)'; for (let i = 0; i < 4; i++) c.fillRect(x + 20, y + 10 + i * 5, 20 + (i * 17) % 38, 2);
+      c.fillStyle = '#2b2f36'; c.fillRect(x + 20, y + 36, w - 40, 8); break;
+    }
+    case 'cell': {
+      c.fillStyle = 'rgba(0,0,0,0.3)'; c.fillRect(x + 3, y + 3, w, h); c.fillStyle = '#3b3f46'; c.fillRect(x, y, w, h);
+      c.fillStyle = '#6a6f78'; for (let i = 0; i <= w; i += 10) c.fillRect(x + i - 1.5, y + h - 14, 3, 14); c.fillRect(x, y + h - 14, w, 3); break;
+    }
+  }
+}
+
+/* Статический слой (пол, стены, мебель) рисуется один раз в offscreen-canvas */
+function buildCache(L, scale) {
+  const cv = document.createElement('canvas'); cv.width = Math.ceil(L.w * scale); cv.height = Math.ceil(L.h * scale);
+  const c = cv.getContext('2d'); c.scale(scale, scale);
+  c.fillStyle = '#4a4036'; c.fillRect(0, 0, L.w, L.h);                     // «порог» в проёмах дверей
+  const rng = mulberry32(L.name === 'apartment' ? 1234 : 77);
+  for (const r of L.rooms) drawFloor(c, r, rng);
+  // ковры
+  if (L.name === 'apartment') {
+    c.fillStyle = 'rgba(150,40,40,0.55)'; rr(c, 48, 104, 170, 100, 8); c.fill(); c.strokeStyle = 'rgba(255,220,180,0.35)'; c.lineWidth = 3; rr(c, 54, 110, 158, 88, 6); c.stroke();
+    c.fillStyle = 'rgba(60,90,130,0.5)'; rr(c, 160, 520, 140, 90, 8); c.fill();
+  }
+  // подписи комнат
+  c.textAlign = 'center'; c.fillStyle = 'rgba(255,255,255,0.14)'; c.font = `bold 20px ${FONT}`;
+  for (const r of L.rooms) if (r.id !== 'yard' && r.id !== 'hall') c.fillText(r.name.toUpperCase(), r.x + r.w / 2, r.y + r.h - 10);
+  c.fillText('КОРИДОР', 480, 424);
+  // стены (с «толщиной»)
+  for (const w of L.walls) {
+    c.fillStyle = '#2b2f3a'; c.fillRect(w.x, w.y, w.w, w.h);
+    c.fillStyle = '#434a5a'; c.fillRect(w.x + 2, w.y + 2, Math.max(1, w.w - 4), Math.max(1, w.h - 4));
+    c.fillStyle = 'rgba(0,0,0,0.25)'; c.fillRect(w.x, w.y + w.h - 3, w.w, 3);
+  }
+  for (const f of L.furn) drawFurn(c, f);
+  for (const b of L.bottles) drawBottle(c, b);
+  return cv;
+}
+
+function drawBottle(c, b) {
+  c.save(); c.translate(b.x, b.y);
+  c.fillStyle = 'rgba(0,0,0,0.3)'; c.beginPath(); c.ellipse(2, 3, 6, 4, 0, 0, 7); c.fill();
+  c.fillStyle = b.type === 'chlor' ? '#e8f06a' : '#58c7ff'; rr(c, -5, -6, 10, 14, 3); c.fill();
+  c.fillStyle = '#fff'; c.fillRect(-5, -1, 10, 5); c.fillStyle = b.type === 'chlor' ? '#c33' : '#2a7'; c.fillRect(-2, -10, 4, 5);
+  c.strokeStyle = 'rgba(0,0,0,0.5)'; c.lineWidth = 1; rr(c, -5, -6, 10, 14, 3); c.stroke();
+  c.restore();
+}
+
+/* Иконки инструментов (процедурные) */
+function drawIcon(c, id, x, y, s) {
+  c.save(); c.translate(x, y); c.scale(s / 14, s / 14); c.lineCap = 'round'; c.lineJoin = 'round';
+  switch (id) {
+    case 'hands':
+      c.fillStyle = '#e8b894'; rr(c, -8, -1, 16, 12, 4); c.fill();
+      for (let i = 0; i < 4; i++) { rr(c, -8 + i * 4.5, -11 - (i === 1 || i === 2 ? 2 : 0), 3.4, 12, 1.7); c.fill(); }
+      rr(c, 6, 0, 3.4, 8, 1.7); c.fill(); c.strokeStyle = 'rgba(0,0,0,0.4)'; c.lineWidth = 0.8; rr(c, -8, -1, 16, 12, 4); c.stroke(); break;
+    case 'bag':
+      c.fillStyle = '#a0a6ae'; rr(c, -9, -12, 18, 24, 6); c.fill(); c.strokeStyle = '#444'; c.lineWidth = 1.2; c.stroke();
+      c.strokeStyle = '#333'; c.lineWidth = 1.5; c.beginPath(); c.moveTo(0, -11); c.lineTo(0, 11); c.stroke(); c.fillStyle = '#333'; c.fillRect(-2, -12, 4, 4); break;
+    case 'mop':
+      c.strokeStyle = '#a9824f'; c.lineWidth = 2.5; c.beginPath(); c.moveTo(8, -14); c.lineTo(-3, 5); c.stroke();
+      c.fillStyle = '#d8d8d0'; rr(c, -12, 3, 16, 8, 3); c.fill(); c.strokeStyle = '#999'; c.lineWidth = 0.8; c.stroke();
+      c.strokeStyle = '#eee'; c.lineWidth = 1.2; for (let i = 0; i < 5; i++) { c.beginPath(); c.moveTo(-10 + i * 3.4, 10); c.lineTo(-11 + i * 3.4, 14); c.stroke(); } break;
+    case 'bucket':
+      c.fillStyle = '#4a7ab0'; c.beginPath(); c.moveTo(-9, -6); c.lineTo(9, -6); c.lineTo(6.5, 11); c.lineTo(-6.5, 11); c.closePath(); c.fill(); c.strokeStyle = '#223a56'; c.lineWidth = 1.2; c.stroke();
+      c.strokeStyle = '#ddd'; c.lineWidth = 1.2; c.beginPath(); c.arc(0, -6, 9, Math.PI, 0); c.stroke();
+      c.fillStyle = 'rgba(255,255,255,0.25)'; c.fillRect(-6, -3, 3, 11); break;
+    case 'sponge':
+      c.fillStyle = '#e6c93a'; rr(c, -11, -7, 22, 14, 3); c.fill(); c.fillStyle = '#4aa84a'; rr(c, -11, 2, 22, 5, 2); c.fill();
+      c.fillStyle = 'rgba(120,90,0,0.45)'; for (let i = 0; i < 6; i++) { c.beginPath(); c.arc(-7 + (i % 3) * 7, -3 + Math.floor(i / 3) * 3.5, 1.2, 0, 7); c.fill(); } break;
+    case 'phone':
+      c.fillStyle = '#20242c'; rr(c, -7, -12, 14, 24, 3); c.fill(); c.strokeStyle = '#888'; c.lineWidth = 1; c.stroke();
+      c.fillStyle = '#5d7fb0'; rr(c, -5, -9, 10, 15, 1.5); c.fill(); c.fillStyle = '#111'; c.beginPath(); c.arc(0, 9, 1.4, 0, 7); c.fill(); break;
+    case 'cam':
+      c.fillStyle = '#fff'; rr(c, -11, -6, 22, 15, 3); c.fill(); c.fillRect(-4, -9, 8, 4);
+      c.fillStyle = '#222'; c.beginPath(); c.arc(0, 2, 5, 0, 7); c.fill(); c.fillStyle = '#6ad'; c.beginPath(); c.arc(0, 2, 2.5, 0, 7); c.fill(); break;
+  }
+  c.restore();
+}
+
+/* ---------------------------------------------------------------- 6. СУЩНОСТИ */
+class Player {
+  constructor(x, y) { this.x = x; this.y = y; this.hw = 8; this.fx = 0; this.fy = 1; this.speed = 100; this.walk = 0; this.stepDist = 0; this.stun = 0; this.moving = false; }
+  get angle() { return Math.atan2(this.fy, this.fx); }
+}
+
+class Body {
+  constructor(id, cx, cy, orient, onBed) {
+    this.id = id; this.orient = orient; this.onBed = !!onBed;
+    this.bagged = false; this.bagProgress = 0; this.carried = false; this.disposed = false; this.photographed = false;
+    this.name = ''; this.look = { shirt: pick(['#3a6ea5', '#a53a3a', '#4a8a4a', '#8a6ab0', '#c0a040', '#555']), pants: pick(['#2a2f45', '#3a3a3a', '#4a3a2a']), hair: pick(['#222', '#6a4a2a', '#c8b070', '#777']) };
+    this.setPos(cx, cy);
+  }
+  setPos(cx, cy) { this.cx = cx; this.cy = cy; const w = this.orient === 'h' ? 54 : 24, h = this.orient === 'h' ? 24 : 54; this.r = { x: cx - w / 2, y: cy - h / 2, w, h }; }
+  setOrient(o) { this.orient = o; this.setPos(this.cx, this.cy); }
+}
+
+class Stain {
+  constructor(x, y, r, surf, seed, dir) { this.x = x; this.y = y; this.r = r; this.surf = surf; this.seed = seed; this.dir = dir || 'top'; this.amt = 1; this.makeBlobs(); }
+  makeBlobs() {
+    const rng = mulberry32(this.seed); this.blobs = [{ dx: 0, dy: 0, r: this.r * 0.7 }];
+    const n = 5 + Math.floor(this.r / 6);
+    for (let i = 0; i < n; i++) { const a = rng() * 6.283, d = rng() * this.r * 0.75; this.blobs.push({ dx: Math.cos(a) * d, dy: Math.sin(a) * d, r: this.r * (0.2 + rng() * 0.3) }); }
+    this.drips = []; for (let i = 0; i < 3; i++) this.drips.push({ dx: (rng() - 0.5) * this.r * 1.2, len: this.r * (0.6 + rng() * 0.9) });
+  }
+}
+
+class Rat {
+  constructor(x, y) { this.x = x; this.y = y; this.ang = rnd(0, 6.28); this.t = rnd(0.5, 2); this.panic = 0; this.cool = 0; this.anim = rnd(0, 6); this.dead = false; }
+  update(dt, game) {
+    this.t -= dt; this.cool = Math.max(0, this.cool - dt); this.panic = Math.max(0, this.panic - dt);
+    const p = game.player, d = dist(p.x, p.y, this.x, this.y);
+    if (d < 60 && this.panic <= 0) this.panic = 0.8;                        // убегает от игрока
+    if (this.panic > 0) { this.ang = Math.atan2(this.y - p.y, this.x - p.x) + Math.sin(this.anim * 3) * 0.5; }
+    else if (this.t <= 0) { this.ang += rnd(-1.6, 1.6); this.t = rnd(0.6, 2.5); if (Math.random() < 0.25) this.t = rnd(0.3, 0.8); }
+    const sp = this.panic > 0 ? 110 : (this.t > 1.5 ? 0 : 38);          // иногда замирает
+    const vx = Math.cos(this.ang) * sp * dt, vy = Math.sin(this.ang) * sp * dt;
+    this.anim += dt * (sp > 0 ? 14 : 2);
+    let hitX = false, hitY = false;
+    if (!game.blockedStatic({ x: this.x + vx - 4, y: this.y - 4, w: 8, h: 8 })) this.x += vx; else hitX = true;
+    if (!game.blockedStatic({ x: this.x - 4, y: this.y + vy - 4, w: 8, h: 8 })) this.y += vy; else hitY = true;
+    if (hitX || hitY) { this.ang += Math.PI + rnd(-0.8, 0.8); this.t = rnd(0.5, 1.5); }
+    this.x = clamp(this.x, 20, game.level.w - 20); this.y = clamp(this.y, 20, game.level.h - 20);
+  }
+}
+
+class Bucket { constructor() { this.carried = true; this.x = 0; this.y = 0; this.water = 0; this.dirt = 0; this.soap = 0; } }
+class Sponge { constructor() { this.wet = 0; this.soap = 0; this.dirt = 0; } }
+
+class Officer {
+  constructor(level) { this.wp = 0; this.x = level.patrol[0].x; this.y = level.patrol[0].y; this.ang = Math.PI / 2; this.wait = 1; this.sus = 0; this.freeze = 0; }
+  update(dt, game) {
+    const L = game.level, p = game.player;
+    if (this.freeze > 0) { this.freeze -= dt; return; }
+    if (this.wait > 0) { this.wait -= dt; this.ang += Math.sin(game.t * 1.5) * dt * 0.8; }
+    else {
+      const t = L.patrol[(this.wp + 1) % L.patrol.length], d = dist(this.x, this.y, t.x, t.y);
+      const want = Math.atan2(t.y - this.y, t.x - this.x); this.ang += clamp(angDiff(want, this.ang), -dt * 4, dt * 4);
+      if (d < 3) { this.wp = (this.wp + 1) % L.patrol.length; this.wait = 1.2; }
+      else { const sp = 46 * dt; this.x += (t.x - this.x) / d * sp; this.y += (t.y - this.y) / d * sp; }
+    }
+    // Зрение: конус + расстояние зависит от скорости игрока (медленно — незаметнее) + линия видимости
+    const range = p.moving ? 150 : 70, d = dist(this.x, this.y, p.x, p.y);
+    let seen = false;
+    if (d < range && Math.abs(angDiff(Math.atan2(p.y - this.y, p.x - this.x), this.ang)) < 0.72) {
+      seen = true;
+      const steps = Math.floor(d / 10);
+      for (let i = 1; i < steps; i++) { const k = i / steps, px = lerp(this.x, p.x, k), py = lerp(this.y, p.y, k); for (const s of L.solids) if (px > s.x && px < s.x + s.w && py > s.y && py < s.y + s.h) { seen = false; break; } if (!seen) break; }
+    }
+    this.sus = clamp(this.sus + (seen ? dt * 1.3 : -dt * 0.6), 0, 1.2);
+    if (this.sus >= 1) { this.sus = 0; this.freeze = 1.8; game.onCaught(); }
+  }
+}
+
+/* ---------------------------------------------------------------- 7. ИГРА */
+const TOOLS = [
+  { id: 'hands', name: 'Руки' }, { id: 'bag', name: 'Мешок' }, { id: 'mop', name: 'Швабра' },
+  { id: 'bucket', name: 'Ведро' }, { id: 'sponge', name: 'Губка' }, { id: 'phone', name: 'Телефон' }
+];
+
+class Game {
+  constructor(canvas) {
+    this.canvas = canvas; this.c = canvas.getContext('2d');
+    this.sfx = new Sfx(); this.t = 0; this.state = 'menu'; this.paused = false; this.landscape = false;
+    this.touches = new Map(); this.buttons = []; this.uiDown = null;
+    this.joy = { active: false, id: null, bx: 0, by: 0, x: 0, y: 0, dx: 0, dy: 0 };
+    this.keys = {}; this.actionHeld = false; this.actionPressed = false; this.worldHold = null;
+    this.toasts = []; this.lastWarn = -9; this.flash = 0; this.fade = { a: 0, dir: 0, cb: null };
+    this.cam = { x: 0, y: 0 }; this.act = { kind: 'none' }; this.hintText = ''; this.showHelp = false;
+    this.apartment = makeApartment(); this.precinct = makePrecinct(); this.level = this.apartment;
+    this.player = new Player(0, 0); this.bucket = new Bucket(); this.sponge = new Sponge();
+    this.bodies = []; this.stains = []; this.rats = []; this.victims = [];
+    this.tool = 'hands'; this.bags = 0; this.carrying = null; this.timers = { step: 0, mop: 0, water: 0, key: 0, rustle: 0, save: 0 };
+    this.report = null; this.stats = this.freshStats(); this.officer = null; this.exitConfirm = 0;
+    this.light = document.createElement('canvas'); this.lctx = this.light.getContext('2d');
+    this.resize(); this.bindInput();
+    Save.load(); this.sfx.muted = !!Save.data.muted;
+  }
+
+  freshStats() { return { disposed: 0, ratsKilled: 0, caught: 0, stainTotal: 0, deleted: 0 }; }
+
+  /* ---------- размеры / retina ---------- */
+  resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 3), w = window.innerWidth, h = window.innerHeight;
+    this.dpr = dpr; this.w = w; this.h = h;
+    this.canvas.width = Math.round(w * dpr); this.canvas.height = Math.round(h * dpr);
+    this.zoom = clamp(w / 330, 1, 2.2);
+    const pr = document.getElementById('probe'), cs = pr ? getComputedStyle(pr) : null, f = v => (parseFloat(v) || 0);
+    this.safe = cs ? { t: f(cs.paddingTop), b: f(cs.paddingBottom), l: f(cs.paddingLeft), r: f(cs.paddingRight) } : { t: 0, b: 0, l: 0, r: 0 };
+    this.invH = 66 + this.safe.b; this.invY = h - this.invH;
+    this.light.width = Math.max(2, Math.ceil(w * 0.5)); this.light.height = Math.max(2, Math.ceil(h * 0.5));
+    this.cacheScale = Math.min(2.5, this.zoom * dpr);
+    this.landscape = w > h * 1.05;
+    this.actBtn = { x: w - 66 - this.safe.r, y: this.invY - 74, r: 42 };
+    this.pauseBtn = { x: w - 30 - this.safe.r, y: this.safe.t + 30, r: 20 };
+  }
+
+  /* ---------- ввод ---------- */
+  bindInput() {
+    const cv = this.canvas;
+    const unlock = () => this.sfx.unlock();
+    const each = (e, fn) => { for (const t of e.changedTouches) fn(t.identifier, t.clientX, t.clientY); };
+    cv.addEventListener('touchstart', e => { e.preventDefault(); unlock(); each(e, (i, x, y) => this.pDown(i, x, y)); }, { passive: false });
+    cv.addEventListener('touchmove', e => { e.preventDefault(); each(e, (i, x, y) => this.pMove(i, x, y)); }, { passive: false });
+    cv.addEventListener('touchend', e => { e.preventDefault(); unlock(); each(e, (i, x, y) => this.pUp(i, x, y)); }, { passive: false });
+    cv.addEventListener('touchcancel', e => { e.preventDefault(); each(e, (i, x, y) => this.pUp(i, x, y, true)); }, { passive: false });
+    // Мышь — только для отладки на компьютере
+    cv.addEventListener('mousedown', e => { unlock(); this.pDown(-1, e.clientX, e.clientY); });
+    window.addEventListener('mousemove', e => { if (this.touches.has(-1)) this.pMove(-1, e.clientX, e.clientY); });
+    window.addEventListener('mouseup', e => { if (this.touches.has(-1)) this.pUp(-1, e.clientX, e.clientY); });
+    document.addEventListener('gesturestart', e => e.preventDefault());
+    document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+    window.addEventListener('resize', () => this.resize());
+    window.addEventListener('orientationchange', () => setTimeout(() => this.resize(), 200));
+    window.addEventListener('keydown', e => {
+      unlock(); this.keys[e.code] = true;
+      if (e.code === 'Space' || e.code === 'KeyE') { if (!this.actionHeld) this.actionPressed = true; this.actionHeld = true; e.preventDefault(); }
+      const m = /^Digit([1-6])$/.exec(e.code); if (m && this.state === 'game') this.tool = TOOLS[+m[1] - 1].id;
+    });
+    window.addEventListener('keyup', e => { this.keys[e.code] = false; if (e.code === 'Space' || e.code === 'KeyE') this.actionHeld = false; });
+    // Автосохранение и пауза при сворачивании
+    const hide = () => { if (this.state === 'game') { this.paused = true; this.saveShift(); } if (this.sfx.ctx && this.sfx.ctx.suspend) this.sfx.ctx.suspend(); };
+    document.addEventListener('visibilitychange', () => { if (document.hidden) hide(); else this.sfx.unlock(); });
+    window.addEventListener('pagehide', hide);
+  }
+
+  inCircle(x, y, b, pad) { return dist(x, y, b.x, b.y) <= b.r + (pad || 0); }
+  inRect(x, y, r) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  pDown(id, x, y) {
+    const tc = { x, y, role: 'none' }; this.touches.set(id, tc);
+    if (this.landscape) return;
+    // Кнопки меню / паузы / отчёта
+    if (this.state === 'menu' || this.state === 'report' || (this.state !== 'menu' && this.paused)) {
+      for (const b of this.buttons) if (this.inRect(x, y, b)) { tc.role = 'ui'; this.uiDown = b.id; return; }
+      return;
+    }
+    if (this.fade.dir !== 0) return;
+    // Игровые состояния
+    if (this.inCircle(x, y, this.pauseBtn, 8)) { tc.role = 'pause'; return; }
+    for (const b of this.buttons) if (this.inRect(x, y, b)) { tc.role = 'ui'; this.uiDown = b.id; return; }
+    if (this.state === 'game' && y >= this.invY) {                         // инвентарь внизу
+      const i = Math.floor(x / (this.w / TOOLS.length)); const t = TOOLS[clamp(i, 0, TOOLS.length - 1)];
+      if (this.tool !== t.id) { this.tool = t.id; this.sfx.pickup(); this.worldHold = null; }
+      tc.role = 'inv'; return;
+    }
+    if (this.inCircle(x, y, this.actBtn, 14)) { tc.role = 'action'; this.actionHeld = true; this.actionPressed = true; return; }
+    if (this.photoBtn && this.inCircle(x, y, this.photoBtn, 6)) { tc.role = 'photo'; const b = this.photoBtn.body; if (b) this.takePhoto(b); return; }
+    // Долгое нажатие по телу в мире = упаковка
+    if (this.state === 'game' && !this.carrying) {
+      const wx = x / this.zoom + this.cam.x, wy = y / this.zoom + this.cam.y;
+      for (const b of this.bodies) if (!b.disposed && !b.carried && !b.bagged && wx > b.r.x - 8 && wx < b.r.x + b.r.w + 8 && wy > b.r.y - 8 && wy < b.r.y + b.r.h + 8) {
+        tc.role = 'world'; this.worldHold = b.id; return;
+      }
+    }
+    if (!this.joy.active && x < this.w * 0.62 && y > this.h * 0.2) {      // плавающий джойстик
+      this.joy.active = true; this.joy.id = id; this.joy.bx = x; this.joy.by = y; this.joy.x = x; this.joy.y = y; this.joy.dx = 0; this.joy.dy = 0; tc.role = 'joy';
+    }
+  }
+  pMove(id, x, y) {
+    const tc = this.touches.get(id); if (!tc) return; tc.x = x; tc.y = y;
+    if (tc.role === 'joy') {
+      const R = 46; let dx = x - this.joy.bx, dy = y - this.joy.by; const d = Math.hypot(dx, dy);
+      if (d > R) { this.joy.bx = x - dx / d * R; this.joy.by = y - dy / d * R; dx = x - this.joy.bx; dy = y - this.joy.by; }  // база «тянется» за пальцем
+      this.joy.x = x; this.joy.y = y;
+      const m = Math.min(1, Math.hypot(dx, dy) / R);
+      if (m < 0.12) { this.joy.dx = 0; this.joy.dy = 0; } else { const a = Math.atan2(dy, dx); this.joy.dx = Math.cos(a) * m; this.joy.dy = Math.sin(a) * m; }
+    }
+  }
+  pUp(id, x, y, cancel) {
+    const tc = this.touches.get(id); if (!tc) return; this.touches.delete(id);
+    if (tc.role === 'joy') { this.joy.active = false; this.joy.dx = 0; this.joy.dy = 0; }
+    else if (tc.role === 'action') { this.actionHeld = false; }
+    else if (tc.role === 'world') { this.worldHold = null; }
+    else if (tc.role === 'pause' && !cancel && this.inCircle(x, y, this.pauseBtn, 14)) { this.paused = true; this.sfx.pickup(); }
+    else if (tc.role === 'ui' && !cancel) {
+      const b = this.buttons.find(b => b.id === this.uiDown && this.inRect(x, y, b));
+      this.uiDown = null; if (b) this.onButton(b.id);
+    }
+  }
+
+  onButton(id) {
+    this.sfx.pickup();
+    switch (id) {
+      case 'new': this.transition(() => { Save.data.shift = null; this.startShift(Save.data.day || 1, null); }); break;
+      case 'continue': this.transition(() => this.startShift(Save.data.day || 1, Save.data.shift)); break;
+      case 'help': this.showHelp = !this.showHelp; break;
+      case 'sound': Save.data.muted = !Save.data.muted; this.sfx.setMuted(Save.data.muted); Save.write(); break;
+      case 'resume': this.paused = false; break;
+      case 'finish': this.paused = false; this.goStation(); break;
+      case 'menu': this.paused = false; if (this.state === 'game') this.saveShift(); this.transition(() => { this.state = 'menu'; this.showHelp = false; }); break;
+      case 'next': this.transition(() => { Save.data.shift = null; this.startShift(Save.data.day, null); }); break;
+      case 'endshift': this.goStation(); break;
+    }
+  }
+
+  transition(cb) { this.fade.dir = 1; this.fade.cb = cb; }
+
+  toast(msg, col) { this.toasts.push({ msg, col: col || '#fff', t: 3 }); if (this.toasts.length > 3) this.toasts.shift(); }
+  warn(msg) { if (this.t - this.lastWarn > 1.4) { this.lastWarn = this.t; this.toast(msg, '#ff9a8a'); this.sfx.err(); } }
+
+  /* ---------- старт смены ---------- */
+  startShift(day, saved) {
+    this.state = 'game'; this.level = this.apartment; this.paused = false; this.showHelp = false;
+    this.stats = this.freshStats(); this.victims = []; this.bodies = []; this.stains = []; this.rats = [];
+    this.bucket = new Bucket(); this.sponge = new Sponge(); this.tool = 'hands'; this.bags = 0; this.carrying = null;
+    this.time = 0; this.shiftOver = false; this.overTimer = 0; this.day = day; this.nextBodyId = 1;
+    this.player = new Player(this.level.start.x, this.level.start.y);
+    if (saved && saved.day === day) this.restoreShift(saved); else this.generateShift(day);
+    this.cam.x = this.player.x; this.cam.y = this.player.y; this.snapCamera();
+    this.toast('Смена ' + day + ': найди тела, убери следы', '#ffd24a');
+  }
+
+  generateShift(day) {
+    const n = Math.min(7, 2 + day), spots = [BODY_SPOTS[0]].concat(shuffle(BODY_SPOTS.slice(1))).slice(0, n);
+    const names = shuffle(NAMES.slice());
+    spots.forEach((s, i) => {
+      const b = new Body(this.nextBodyId++, s.x, s.y, s.o, s.bed); b.name = names[i]; this.bodies.push(b);
+      const cnt = rndi(3, 4);
+      for (let k = 0; k < cnt; k++) {              // лужи вокруг тела (если не попадают под мебель)
+        const px = s.x + rnd(-34, 34), py = s.y + rnd(-34, 34);
+        if (b.onBed && px > 28 && px < 148 && py > 496 && py < 664) continue;
+        if (this.pointSolid(px, py)) continue;
+        this.addStain(px, py, rnd(13, 24), 'floor');
+      }
+      if (b.onBed) { this.addStain(165, 600, 16, 'floor'); this.addStain(150, 560, 12, 'floor'); }
+    });
+    shuffle(FLOOR_SPOTS.slice()).slice(0, Math.min(10, 5 + day)).forEach(s => this.addStain(s.x, s.y, rnd(12, 22), 'floor'));
+    shuffle(WALL_SPOTS.slice()).slice(0, Math.min(9, 3 + day)).forEach(s => this.addStain(s.x, s.y, rnd(11, 16), 'wall', s.dir));
+    shuffle(CEIL_SPOTS.slice()).slice(0, Math.min(5, 1 + day)).forEach(s => this.addStain(s.x, s.y, rnd(15, 22), 'ceil'));
+    // крысы
+    const rc = Math.min(8, 5 + Math.floor(day / 2)); shuffle(FLOOR_SPOTS.slice()).slice(0, rc).forEach(s => this.rats.push(new Rat(s.x + rnd(-10, 10), s.y + rnd(-10, 10))));
+    this.stats.stainTotal = this.stains.length;
+  }
+  addStain(x, y, r, surf, dir) { const s = new Stain(x, y, r, surf, Math.floor(Math.random() * 1e9), dir); this.stains.push(s); return s; }
+  pointSolid(x, y) { for (const s of this.level.solids) if (x > s.x - 4 && x < s.x + s.w + 4 && y > s.y - 4 && y < s.y + s.h + 4) return true; return false; }
+
+  /* ---------- сохранение смены ---------- */
+  saveShift() {
+    if (this.state !== 'game') return;
+    const p = this.player;
+    Save.data.shift = {
+      day: this.day, time: this.time, px: p.x, py: p.y, tool: this.tool, bags: this.bags, nid: this.nextBodyId, over: this.shiftOver,
+      bucket: { carried: this.bucket.carried, x: this.bucket.x, y: this.bucket.y, water: this.bucket.water, dirt: this.bucket.dirt, soap: this.bucket.soap },
+      sponge: { wet: this.sponge.wet, soap: this.sponge.soap, dirt: this.sponge.dirt },
+      bodies: this.bodies.map(b => ({ id: b.id, cx: b.cx, cy: b.cy, o: b.orient, bed: b.onBed, bag: b.bagged, car: b.carried, dis: b.disposed, ph: b.photographed, name: b.name, look: b.look })),
+      stains: this.stains.map(s => ({ x: s.x, y: s.y, r: s.r, surf: s.surf, seed: s.seed, dir: s.dir, amt: s.amt })),
+      rats: this.rats.map(r => ({ x: r.x, y: r.y })), victims: this.victims.map(v => ({ id: v.id, name: v.name })), stats: this.stats
+    };
+    Save.write();
+  }
+  restoreShift(s) {
+    try {
+      this.time = s.time; this.tool = s.tool; this.bags = s.bags; this.nextBodyId = s.nid; this.shiftOver = !!s.over;
+      this.player.x = s.px; this.player.y = s.py; Object.assign(this.bucket, s.bucket); Object.assign(this.sponge, s.sponge);
+      this.bodies = s.bodies.map(d => { const b = new Body(d.id, d.cx, d.cy, d.o, d.bed); b.bagged = d.bag; b.carried = d.car; b.disposed = d.dis; b.photographed = d.ph; b.name = d.name; b.look = d.look; if (b.carried) this.carrying = b; return b; });
+      this.stains = s.stains.map(d => { const st = new Stain(d.x, d.y, d.r, d.surf, d.seed, d.dir); st.amt = d.amt; return st; });
+      this.rats = s.rats.map(d => new Rat(d.x, d.y)); this.victims = s.victims.map(v => ({ id: v.id, name: v.name, deleted: false, progress: 0 }));
+      this.stats = Object.assign(this.freshStats(), s.stats);
+    } catch (e) { this.bodies = []; this.stains = []; this.rats = []; this.victims = []; this.carrying = null; this.generateShift(this.day); }
+  }
+
+  /* ---------- коллизии (AABB) ---------- */
+  blockedStatic(rect) { const S = this.level.solids; for (let i = 0; i < S.length; i++) if (aabb(rect, S[i])) return true; return false; }
+  blockedAt(rect, ignore) {
+    if (this.blockedStatic(rect)) return true;
+    if (this.level === this.apartment) for (const b of this.bodies) { if (b.carried || b.disposed || b === ignore) continue; if (aabb(rect, b.r)) return true; }
+    return false;
+  }
+  moveEntity(e, dx, dy) {
+    const hw = e.hw, L = this.level;
+    let nx = clamp(e.x + dx, hw, L.w - hw); if (!this.blockedAt({ x: nx - hw, y: e.y - hw, w: hw * 2, h: hw * 2 })) e.x = nx;
+    let ny = clamp(e.y + dy, hw, L.h - hw); if (!this.blockedAt({ x: e.x - hw, y: ny - hw, w: hw * 2, h: hw * 2 })) e.y = ny;
+  }
+  // Если игрока «зажало» (например, тело положили слишком близко) — выталкиваем из прямоугольника
+  unstick() {
+    const p = this.player, hw = p.hw; if (!this.blockedAt({ x: p.x - hw, y: p.y - hw, w: hw * 2, h: hw * 2 })) return;
+    for (let r = 2; r < 40; r += 2) for (let a = 0; a < 6.28; a += 0.5) {
+      const nx = p.x + Math.cos(a) * r, ny = p.y + Math.sin(a) * r;
+      if (!this.blockedAt({ x: nx - hw, y: ny - hw, w: hw * 2, h: hw * 2 })) { p.x = nx; p.y = ny; return; }
+    }
+  }
+  // Поиск свободного места для тела вокруг точки (учитывает мебель, стены, игрока и другие тела)
+  findFreeSpot(body, cx, cy, minR, maxR, prefAng) {
+    const orients = this.player ? [body.orient, body.orient === 'h' ? 'v' : 'h'] : [body.orient];
+    for (let r = minR; r <= maxR; r += 6) for (let k = 0; k < 16; k++) {
+      const a = (prefAng === undefined ? 0 : prefAng) + (k % 2 ? 1 : -1) * Math.ceil(k / 2) * (6.283 / 16);
+      const x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r;
+      for (const o of orients) {
+        const w = o === 'h' ? 54 : 24, h = o === 'h' ? 24 : 54, rect = { x: x - w / 2, y: y - h / 2, w, h };
+        const p = this.player, pr = { x: p.x - 12, y: p.y - 12, w: 24, h: 24 };
+        if (x < 24 || y < 24 || x > this.level.w - 24 || y > this.level.h - 24) continue;
+        if (!this.blockedAt(rect, body) && !aabb(rect, pr)) return { x, y, o };
+      }
+    }
+    return null;
+  }
+
+  /* ---------- контекстные действия ---------- */
+  nearSource(x, y) { for (const s of this.level.sources) if (rectDist(x, y, s) <= 30) return s; return null; }
+  nearBottle(x, y) { for (const b of this.level.bottles) if (dist(x, y, b.x, b.y) <= 36) return b; return null; }
+  bucketNear() { const B = this.bucket, p = this.player; return B.carried || dist(p.x, p.y, B.x, B.y) <= 110; }
+  toolPoint(d) { const p = this.player; return { x: p.x + p.fx * d, y: p.y + p.fy * d }; }
+  floorStainsNear(rate) { const mp = this.toolPoint(22), out = []; for (const s of this.stains) if (s.surf === 'floor' && dist(mp.x, mp.y, s.x, s.y) <= s.r * (0.45 + 0.55 * s.amt) + 16) out.push(s); return out; }
+  upStainsNear() { const p = this.player, out = []; for (const s of this.stains) if (s.surf !== 'floor' && dist(p.x, p.y, s.x, s.y) <= (s.surf === 'wall' ? 50 : 40)) out.push(s); return out; }
+
+  resolveContext() {
+    if (this.state === 'station') return this.stationContext();
+    const p = this.player, L = this.level, tool = this.tool, B = this.bucket, S = this.sponge;
+    // --- Тело на руках
+    if (this.carrying) {
+      if (rectDist(p.x, p.y, L.van) <= 40) return { kind: 'tap', label: 'В машину', run: () => this.loadVan() };
+      return { kind: 'tap', label: 'Положить', run: () => this.dropCarried(), hint: 'Отнеси тело к машине — она во дворе справа' };
+    }
+    const bodyTool = tool === 'hands' || tool === 'bag';
+    let nb = null, nd = 1e9;
+    for (const b of this.bodies) { if (b.disposed || b.carried) continue; const d = rectDist(p.x, p.y, b.r); if (d < nd) { nd = d; nb = b; } }
+    // --- Телефон
+    if (tool === 'phone') {
+      if (nb && nd <= 80) return nb.photographed ? { kind: 'none', hint: 'Это тело уже сфотографировано' } : { kind: 'tap', label: 'Снять', icon: 'cam', run: () => this.takePhoto(nb) };
+      return { kind: 'none', hint: 'Подойди к телу и нажми «Снять»' };
+    }
+    // --- Тела (руки или мешок)
+    const reach = nb && nb.onBed ? 66 : 26;   // тело на кровати: кровать-препятствие не даёт подойти вплотную
+    if (nb && nd <= reach) {
+      if (bodyTool) {
+        if (nb.bagged) return { kind: 'tap', label: 'Взять', run: () => this.pickBody(nb) };
+        if (nb.onBed) return { kind: 'tap', label: 'Снять с кровати', small: true, run: () => this.liftOffBed(nb) };
+        if (this.bags > 0) return { kind: 'hold', label: 'Упаковать', hint: 'Держи кнопку 3 секунды', tick: dt => this.bagTick(nb, dt) };
+        // мешков нет — подсказка, дальше проверим стопку
+      } else if (tool !== 'bucket' && tool !== 'mop' && tool !== 'sponge') { /* ничего */ }
+    }
+    // --- Стопка мешков (любым инструментом)
+    if (rectDist(p.x, p.y, L.bagStack) <= 30) {
+      if (this.bags >= 8) return { kind: 'none', hint: 'Больше 8 мешков не унести' };
+      return { kind: 'tap', label: 'Взять мешок', small: true, run: () => this.takeBag() };
+    }
+    if (bodyTool) {
+      if (nb && nd <= reach && !nb.bagged && !nb.onBed && this.bags <= 0) return { kind: 'none', hint: 'Нужен мешок — возьми со стопки в коридоре у машины' };
+      // Крысы: ударить
+      for (const r of this.rats) if (!r.dead && dist(p.x, p.y, r.x, r.y) <= 30) return { kind: 'tap', label: 'Ударить', run: () => this.killRat(r) };
+    }
+    // --- Ведро
+    if (tool === 'bucket') {
+      if (B.carried) {
+        const src = this.nearSource(p.x, p.y), bot = this.nearBottle(p.x, p.y);
+        if (src && B.water > 0.02 && B.dirt > 0.04) return { kind: 'tap', label: 'Слить воду', small: true, run: () => this.emptyBucket() };
+        if (src && B.water < 0.98) return { kind: 'tap', label: 'Набрать воду', small: true, run: () => this.fillBucket() };
+        if (bot) { if (B.water <= 0.02) return { kind: 'none', hint: 'Сначала набери воды в ведро' }; return { kind: 'tap', label: 'Средство', run: () => this.addSoap(bot) }; }
+        return { kind: 'tap', label: 'Поставить', run: () => this.placeBucket(), hint: src ? 'Ведро полное и чистое' : '' };
+      }
+      if (dist(p.x, p.y, B.x, B.y) <= 36) return { kind: 'tap', label: 'Взять ведро', small: true, run: () => this.pickBucket() };
+      return { kind: 'none', hint: 'Ведро осталось позади' };
+    }
+    // --- Швабра
+    if (tool === 'mop') { const st = this.mopStatus(); return { kind: 'hold', label: 'Мыть', hint: st.ok ? 'Держи кнопку и води по пятну' : st.reason, tick: dt => this.mopTick(dt) }; }
+    // --- Губка
+    if (tool === 'sponge') {
+      const near = this.upStainsNear(), bn = this.bucketNear();
+      if (bn && B.water > 0.02 && S.wet < 0.95 && (S.wet < 0.35 || !near.length)) return { kind: 'tap', label: 'Смочить', run: () => this.wetSponge() };
+      if (near.length) {
+        if (S.wet <= 0.02) return { kind: 'none', hint: bn ? 'В ведре нет воды' : 'Поставь ведро рядом и смочи губку' };
+        return { kind: 'hold', label: 'Тереть', hint: 'Держи кнопку, чтобы тереть пятно', tick: dt => this.spongeTick(dt, near) };
+      }
+      return { kind: 'none', hint: 'Подойди к пятну на стене или потолке' };
+    }
+    return { kind: 'none', hint: '' };
+  }
+
+  stationContext() {
+    const p = this.player, L = this.level;
+    if (this.inRect(p.x, p.y, L.exitZone)) return { kind: 'tap', label: 'Выйти', run: () => this.tryExitStation() };
+    if (rectDist(p.x, p.y, L.terminal) <= 36) {
+      const v = this.victims.find(v => !v.deleted);
+      if (v) return { kind: 'hold', label: 'Удалить', sub: v.name, hint: 'Держи: удаляю запись «' + v.name + '»', tick: dt => this.deleteTick(v, dt) };
+      return { kind: 'none', hint: this.victims.length ? 'Все записи удалены — уходи через дверь' : 'В системе нет записей — ты никого не сфотографировал' };
+    }
+    return { kind: 'none', hint: '' };
+  }
+
+  /* ---------- конкретные действия ---------- */
+  takeBag() { this.bags++; this.sfx.rustle(); this.sfx.pickup(); this.toast('Мешков: ' + this.bags); }
+  takePhoto(b) {
+    if (b.photographed) return;
+    b.photographed = true; this.flash = 1; this.sfx.photo(); this.victims.push({ id: b.id, name: b.name, deleted: false, progress: 0 });
+    this.toast('Жертва записана: ' + b.name, '#9ad0ff');
+  }
+  bagTick(b, dt) {
+    this.activeBag = b; b.bagProgress = Math.min(1, b.bagProgress + dt / BAG_TIME);
+    this.timers.rustle -= dt; if (this.timers.rustle <= 0) { this.timers.rustle = 0.35; this.sfx.rustle(); }
+    if (b.bagProgress >= 1) { b.bagged = true; b.bagProgress = 0; this.bags--; this.sfx.ok(); this.toast('Тело упаковано', '#9cff9c'); this.worldHold = null; }
+  }
+  pickBody(b) {
+    if (b.onBed) { this.warn('Сначала сними тело с кровати'); return; }
+    b.carried = true; this.carrying = b; this.sfx.pickup(); this.toast('Несёшь тело — медленнее!', '#ffd24a');
+  }
+  liftOffBed(b) {
+    const spot = this.findFreeSpot(b, b.cx, b.cy, 60, 110, 0);
+    if (!spot) { this.warn('Рядом с кроватью нет места'); return; }
+    b.onBed = false; b.orient = spot.o; b.setPos(spot.x, spot.y); this.sfx.drop();
+    this.addStain(spot.x, spot.y, 14, 'floor'); this.stats.stainTotal++;
+    this.toast('Тело снято с кровати', '#ffd24a');
+  }
+  dropCarried() {
+    const b = this.carrying, p = this.player; if (!b) return;
+    const spot = this.findFreeSpot(b, p.x, p.y, 28, 70, p.angle);
+    if (!spot) { this.warn('Здесь некуда положить тело'); return; }
+    b.carried = false; b.orient = spot.o; b.setPos(spot.x, spot.y); this.carrying = null; this.sfx.drop();
+  }
+  loadVan() {
+    const b = this.carrying; if (!b) return;
+    b.carried = false; b.disposed = true; this.carrying = null; this.stats.disposed++; this.sfx.thud(); this.toast('Тело в машине', '#9cff9c');
+  }
+  killRat(r) {
+    r.dead = true; this.stats.ratsKilled++; this.sfx.splat(); this.addStain(r.x, r.y, 9, 'floor'); this.stats.stainTotal++;
+    this.rats = this.rats.filter(x => !x.dead); this.toast('Крыса раздавлена. Теперь придётся отмывать', '#ff9a8a');
+  }
+  fillBucket() { const B = this.bucket; B.water = 1; B.dirt = 0; B.soap = 0; this.sfx.water(); this.toast('Ведро наполнено'); }
+  emptyBucket() { const B = this.bucket; B.water = 0; B.dirt = 0; B.soap = 0; this.sfx.water(); this.toast('Вода слита — набери чистой'); }
+  addSoap(bot) {
+    const B = this.bucket; B.soap = Math.min(1.6, B.soap + (bot.type === 'chlor' ? 1.0 : 0.6)); this.sfx.pickup(); this.sfx.water();
+    this.toast(bot.type === 'chlor' ? 'Добавлена хлорка — сильное средство' : 'Добавлено моющее');
+  }
+  placeBucket() { const p = this.player, B = this.bucket; B.carried = false; B.x = p.x + p.fx * 20; B.y = p.y + p.fy * 20; this.sfx.drop(); }
+  pickBucket() { this.bucket.carried = true; this.sfx.pickup(); }
+  wetSponge() { const S = this.sponge, B = this.bucket; S.wet = 1; S.soap = B.soap; S.dirt = B.dirt; B.dirt = Math.min(1, B.dirt + 0.02); B.water = Math.max(0, B.water - 0.03); this.sfx.water(); }
+
+  mopStatus() {
+    const B = this.bucket;
+    if (!this.bucketNear()) return { ok: false, reason: 'Ведро слишком далеко — поставь его рядом' };
+    if (B.water <= 0.02) return { ok: false, reason: 'В ведре нет воды (выбери ведро у раковины)' };
+    if (B.dirt >= 0.95) return { ok: false, reason: 'Вода слишком грязная — слей и набери заново' };
+    if (!this.floorStainsNear().length) return { ok: false, reason: this.upStainsNear().length ? 'Это на стене/потолке — нужна губка' : 'Подойди вплотную к пятну на полу' };
+    return { ok: true, reason: '' };
+  }
+  // Общий расчёт очистки: возвращает суммарно оттёртое
+  cleanStains(list, dt, rate, eff) {
+    let total = 0;
+    for (const s of list) { const d = Math.min(s.amt, rate * eff * dt); s.amt -= d; total += d; }
+    if (list.some(s => s.amt <= 0.03)) this.stains = this.stains.filter(s => s.amt > 0.03);
+    return total;
+  }
+  mopTick(dt) {
+    const st = this.mopStatus(); if (!st.ok) { this.warn(st.reason); return; }
+    const B = this.bucket, p = this.player, list = this.floorStainsNear();
+    const eff = (1 - B.dirt * 0.85) * (1 + B.soap * 1.5), rate = 0.55 * (p.moving ? 1.4 : 0.7);
+    const cleaned = this.cleanStains(list, dt, rate, eff);
+    B.dirt = Math.min(1, B.dirt + cleaned * 0.2); B.water = Math.max(0, B.water - cleaned * 0.05); B.soap = Math.max(0, B.soap - cleaned * 0.1);
+    this.timers.mop -= dt; if (this.timers.mop <= 0) { this.timers.mop = 0.24; this.sfx.mop(); }
+    this.mopSwing = (this.mopSwing || 0) + dt * 10;
+  }
+  spongeTick(dt, list) {
+    const S = this.sponge; if (S.wet <= 0.02) return;
+    const eff = (1 + S.soap * 1.2) * (1 - S.dirt * 0.7), cleaned = this.cleanStains(list, dt, 0.5, eff);
+    S.wet = Math.max(0, S.wet - cleaned * 0.35); if (S.wet <= 0.02) this.toast('Губка высохла — смочи в ведре', '#ffd24a');
+    this.timers.mop -= dt; if (this.timers.mop <= 0) { this.timers.mop = 0.26; this.sfx.mop(); }
+    this.mopSwing = (this.mopSwing || 0) + dt * 10;
+  }
+  deleteTick(v, dt) {
+    v.progress = Math.min(1, v.progress + dt / DELETE_TIME);
+    this.timers.key -= dt; if (this.timers.key <= 0) { this.timers.key = 0.09; this.sfx.key(); }
+    if (v.progress >= 1) { v.deleted = true; this.stats.deleted++; this.sfx.ok(); this.toast('Запись удалена: ' + v.name, '#9cff9c'); if (this.victims.every(x => x.deleted)) this.toast('Все записи удалены. Уходи через дверь', '#ffd24a'); }
+  }
+  onCaught() {
+    this.stats.caught++; this.sfx.alarm(); this.toast('Тебя заметили! −40 $', '#ff6a6a');
+    for (const v of this.victims) if (!v.deleted) v.progress = 0;
+    this.player.x = this.level.start.x; this.player.y = this.level.start.y; this.snapCamera();
+  }
+  tryExitStation() {
+    const left = this.victims.filter(v => !v.deleted).length;
+    if (left > 0 && this.exitConfirm <= 0) { this.exitConfirm = 4; this.toast('Записей осталось: ' + left + '. Нажми ещё раз, чтобы уйти', '#ffd24a'); this.sfx.err(); return; }
+    this.finishShift();
+  }
+
+  /* ---------- переходы между состояниями ---------- */
+  goStation() {
+    this.saveShift();
+    if (this.carrying) { this.carrying.carried = false; this.carrying = null; }
+    this.transition(() => {
+      this.state = 'station'; this.level = this.precinct; this.paused = false;
+      this.player = new Player(this.level.start.x, this.level.start.y); this.officer = new Officer(this.level);
+      this.exitConfirm = 0; this.snapCamera();
+      this.toast(this.victims.length ? 'Найди терминал и удали записи о жертвах' : 'Ты никого не сфотографировал — удалять нечего', '#ffd24a');
+      this.toast('Двигайся медленно — полицейский тебя не заметит', '#9ad0ff');
+    });
+  }
+  finishShift() {
+    const s = this.stats, total = this.bodies.length, remain = this.stains.reduce((a, b) => a + b.amt, 0);
+    const cleanPct = s.stainTotal ? clamp(1 - remain / s.stainTotal, 0, 1) : 1;
+    const photographed = this.victims.length, deleted = s.deleted, unphot = this.bodies.filter(b => !b.photographed).length;
+    const lines = [
+      ['Тела вывезены: ' + s.disposed + ' / ' + total, s.disposed * 120],
+      ['Чистота: ' + Math.round(cleanPct * 100) + '%', Math.round(cleanPct * 300)],
+      ['Записи удалены: ' + deleted + ' / ' + photographed, deleted * 80],
+      ['Тела оставлены: ' + (total - s.disposed), -(total - s.disposed) * 150],
+      ['Не сфотографированы: ' + unphot, -unphot * 50],
+      ['Записи остались в системе: ' + (photographed - deleted), -(photographed - deleted) * 80],
+      ['Убито крыс: ' + s.ratsKilled, -s.ratsKilled * 5],
+      ['Тебя замечали: ' + s.caught, -s.caught * 40]
+    ];
+    const pay = Math.max(0, lines.reduce((a, l) => a + l[1], 0)), maxPay = total * 120 + 300 + total * 80, ratio = pay / maxPay;
+    const stars = pay <= 0 ? 0 : clamp(Math.ceil(ratio * 5), 1, 5);
+    const D = Save.data; D.money += pay; D.shifts++; D.best = Math.max(D.best, pay); D.day = this.day + 1; D.shift = null; Save.write();
+    this.report = { lines, pay, stars, day: this.day };
+    this.transition(() => { this.state = 'report'; this.level = this.apartment; this.paused = false; });
+  }
+
+  /* ---------- цель (подсказка + стрелка) ---------- */
+  objective() {
+    const p = this.player, L = this.level;
+    if (this.state === 'station') {
+      if (this.victims.some(v => !v.deleted)) return { text: 'Удали записи в терминале (держи кнопку)', x: L.terminal.x + 50, y: L.terminal.y + 54 };
+      return { text: 'Готово — выходи через дверь внизу', x: L.exitZone.x + 40, y: L.exitZone.y + 10 };
+    }
+    if (this.carrying) return { text: 'Отнеси тело к машине (двор справа)', x: L.van.x - 20, y: L.van.y + 85 };
+    let nb = null, nd = 1e9;
+    for (const b of this.bodies) { if (b.disposed) continue; const d = dist(p.x, p.y, b.cx, b.cy); if (d < nd) { nd = d; nb = b; } }
+    if (nb) {
+      if (!nb.photographed) return { text: 'Сфотографируй тело (Телефон → «Снять»)', x: nb.cx, y: nb.cy, tool: 'phone' };
+      if (nb.onBed) return { text: 'Сними тело с кровати (Руки)', x: nb.cx, y: nb.cy, tool: 'hands' };
+      if (!nb.bagged) {
+        if (this.bags <= 0) return { text: 'Возьми мешок со стопки в коридоре', x: L.bagStack.x + 22, y: L.bagStack.y + 13 };
+        return { text: 'Упакуй тело: держи кнопку 3 секунды', x: nb.cx, y: nb.cy, tool: 'hands' };
+      }
+      return { text: 'Возьми тело (Руки) и неси к машине', x: nb.cx, y: nb.cy, tool: 'hands' };
+    }
+    if (this.stains.length) {
+      const B = this.bucket;
+      if (B.water < 0.15 || B.dirt > 0.8) {
+        let ns = null, d0 = 1e9; for (const s of L.sources) { const d = dist(p.x, p.y, s.x + s.w / 2, s.y + s.h / 2); if (d < d0) { d0 = d; ns = s; } }
+        return { text: B.dirt > 0.8 ? 'Слей грязную воду и набери чистой (Ведро)' : 'Набери воды в ведро у раковины', x: ns.x + ns.w / 2, y: ns.y + ns.h / 2, tool: 'bucket' };
+      }
+      let ns = null, d0 = 1e9; for (const s of this.stains) { const d = dist(p.x, p.y, s.x, s.y); if (d < d0) { d0 = d; ns = s; } }
+      if (ns.surf === 'floor') return { text: 'Отмой пол шваброй (держи кнопку, води)', x: ns.x, y: ns.y, tool: 'mop' };
+      return { text: this.sponge.wet < 0.3 ? 'Смочи губку в ведре, потом три пятно' : 'Оттирай пятно на ' + (ns.surf === 'wall' ? 'стене' : 'потолке') + ' губкой', x: ns.x, y: ns.y, tool: 'sponge' };
+    }
+    return { text: 'Всё чисто! Нажми «Закончить смену»', x: 0, y: 0, done: true };
+  }
+
+  snapCamera() { const t = this.camTarget(); this.cam.x = t.x; this.cam.y = t.y; }
+  camTarget() {
+    const z = this.zoom, vw = this.w / z, vh = this.h / z, p = this.player, L = this.level;
+    const usableH = (this.state === 'game' ? this.h - this.invH : this.h - 60) / z;
+    let x = p.x - vw / 2, y = p.y - usableH / 2;
+    x = vw >= L.w ? (L.w - vw) / 2 : clamp(x, 0, L.w - vw); y = vh >= L.h ? (L.h - vh) / 2 : clamp(y, 0, L.h - vh);
+    return { x, y };
+  }
+
+  /* ================= ОБНОВЛЕНИЕ ================= */
+  update(dt) {
+    this.t += dt;
+    // fade между экранами
+    const f = this.fade;
+    if (f.dir === 1) { f.a += dt * 3.2; if (f.a >= 1) { f.a = 1; f.dir = -1; if (f.cb) { const cb = f.cb; f.cb = null; cb(); } } }
+    else if (f.dir === -1) { f.a -= dt * 3.2; if (f.a <= 0) { f.a = 0; f.dir = 0; } }
+    for (const t of this.toasts) t.t -= dt; this.toasts = this.toasts.filter(t => t.t > 0);
+    this.flash = Math.max(0, this.flash - dt * 3); this.exitConfirm = Math.max(0, this.exitConfirm - dt);
+    if (this.landscape || this.paused) return;
+    if (this.state === 'game') this.updateWorld(dt);
+    else if (this.state === 'station') this.updateWorld(dt);
+  }
+
+  updateWorld(dt) {
+    const p = this.player, isGame = this.state === 'game';
+    if (isGame) {
+      this.time += dt;
+      if (this.time >= SHIFT_SECONDS && !this.shiftOver) { this.shiftOver = true; this.overTimer = 6; this.toast('Рассвет! Смена закончена — в участок', '#ffd24a'); this.sfx.alarm(); }
+      if (this.shiftOver) { this.overTimer -= dt; if (this.overTimer <= 0) { this.overTimer = 999; this.goStation(); return; } }
+    }
+    // --- ввод движения (джойстик + клавиатура)
+    let ix = this.joy.dx, iy = this.joy.dy;
+    if (this.keys.KeyA || this.keys.ArrowLeft) ix -= 1; if (this.keys.KeyD || this.keys.ArrowRight) ix += 1;
+    if (this.keys.KeyW || this.keys.ArrowUp) iy -= 1; if (this.keys.KeyS || this.keys.ArrowDown) iy += 1;
+    const m = Math.hypot(ix, iy); if (m > 1) { ix /= m; iy /= m; }
+    p.stun = Math.max(0, p.stun - dt);
+    let speed = p.speed * (this.carrying ? 0.7 : 1) * (p.stun > 0 ? 0.45 : 1);
+    if (this.actionHeld && this.act && this.act.kind === 'hold') speed *= 0.6;                   // при мытье/упаковке двигаемся медленнее
+    p.moving = Math.hypot(ix, iy) > 0.55;
+    if (ix || iy) {
+      const mag = Math.min(1, Math.hypot(ix, iy)); p.fx = ix / Math.hypot(ix, iy); p.fy = iy / Math.hypot(ix, iy);
+      const ox = p.x, oy = p.y; this.moveEntity(p, ix * speed * dt, iy * speed * dt);
+      const moved = Math.hypot(p.x - ox, p.y - oy); p.walk += moved * 0.25; p.stepDist += moved;
+      if (p.stepDist > 22) { p.stepDist = 0; this.sfx.step(); }
+    }
+    this.unstick();
+    // --- ведро: следует за игроком, либо стоит (и наполняется под краном)
+    const B = this.bucket;
+    if (B.carried) { B.x = p.x - 12; B.y = p.y + 10; }
+    else if (isGame) {
+      const src = this.nearSource(B.x, B.y);
+      if (src && B.water < 1) {
+        const old = B.water; B.water = Math.min(1, B.water + dt * 0.25); if (B.water > 0) B.dirt *= old / B.water;
+        this.timers.water -= dt; if (this.timers.water <= 0) { this.timers.water = 0.3; this.sfx.water(); }
+      }
+    }
+    if (isGame) {
+      // --- крысы
+      for (const r of this.rats) {
+        r.update(dt, this);
+        if (r.cool <= 0 && dist(p.x, p.y, r.x, r.y) < 11) {                            // наступил на крысу
+          r.cool = 2; r.panic = 1.6; this.sfx.squeak(); p.stun = this.carrying ? 0.7 : 0.4; this.toast('Пи-и-и! Ты наступил на крысу', '#ffb070');
+        }
+      }
+    } else if (this.officer) this.officer.update(dt, this);
+    // --- контекст и действие
+    this.activeBag = null;
+    const act = this.act = this.resolveContext();
+    if (this.actionPressed) {
+      this.actionPressed = false;
+      if (act.kind === 'tap' && act.run) act.run(); else if (act.hint) this.warn(act.hint);
+    }
+    if (this.actionHeld && act.kind === 'hold' && act.tick) act.tick(dt);
+    // Долгое нажатие по телу в мире — упаковка
+    if (isGame && this.worldHold !== null) {
+      const b = this.bodies.find(b => b.id === this.worldHold);
+      if (b && !b.disposed && !b.bagged && !this.carrying) {
+        if (rectDist(p.x, p.y, b.r) > 60) { this.warn('Подойди ближе к телу'); this.worldHold = null; }
+        else if (b.onBed) { this.warn('Сначала сними тело с кровати (Руки)'); this.worldHold = null; }
+        else if (this.bags <= 0) { this.warn('Нужен мешок — возьми со стопки'); this.worldHold = null; }
+        else this.bagTick(b, dt);
+      } else this.worldHold = null;
+    }
+    // сброс прогресса упаковки, если палец отпущен
+    for (const b of this.bodies) if (b !== this.activeBag && b.bagProgress > 0) b.bagProgress = Math.max(0, b.bagProgress - dt * 1.5);
+    if (this.state === 'station') for (const v of this.victims) if (!v.deleted && v.progress > 0 && !(this.actionHeld && act.kind === 'hold' && act.sub === v.name)) v.progress = Math.max(0, v.progress - dt * 1.2);
+    // --- камера
+    const t = this.camTarget(), k = Math.min(1, dt * 8); this.cam.x += (t.x - this.cam.x) * k; this.cam.y += (t.y - this.cam.y) * k;
+    // --- подсказка
+    const obj = this.objective(); this.obj = obj;
+    this.hintText = act.hint || obj.text;
+    // --- автосохранение
+    if (isGame) { this.timers.save += dt; if (this.timers.save > 5) { this.timers.save = 0; this.saveShift(); } }
+  }
+
+  /* ================= ОТРИСОВКА ================= */
+  txt(s, x, y, size, color, align, weight) { const c = this.c; c.font = `${weight || '600'} ${size}px ${FONT}`; c.fillStyle = color; c.textAlign = align || 'left'; c.textBaseline = 'alphabetic'; c.fillText(s, x, y); }
+  panel(x, y, w, h, fill, r) { const c = this.c; c.fillStyle = fill || 'rgba(10,12,18,0.72)'; rr(c, x, y, w, h, r === undefined ? 12 : r); c.fill(); }
+  bar(x, y, w, h, v, col, bg) { const c = this.c; c.fillStyle = bg || 'rgba(255,255,255,0.14)'; rr(c, x, y, w, h, h / 2); c.fill(); if (v > 0.01) { c.fillStyle = col; rr(c, x, y, Math.max(h, w * clamp(v, 0, 1)), h, h / 2); c.fill(); } }
+  btn(id, label, x, y, w, h, primary) {
+    const c = this.c; this.buttons.push({ id, x, y, w, h });
+    const down = this.uiDown === id;
+    c.fillStyle = primary ? (down ? '#b8861c' : '#e0a31a') : (down ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.12)'); rr(c, x, y, w, h, 14); c.fill();
+    c.strokeStyle = primary ? '#ffd47a' : 'rgba(255,255,255,0.3)'; c.lineWidth = 1.5; c.stroke();
+    this.txt(label, x + w / 2, y + h / 2 + 6, 17, primary ? '#1a1206' : '#fff', 'center', '700');
+  }
+
+  draw() {
+    const c = this.c, d = this.dpr; this.buttons = [];
+    c.setTransform(d, 0, 0, d, 0, 0);
+    if (this.landscape) { c.fillStyle = '#0b0d12'; c.fillRect(0, 0, this.w, this.h); this.txt('Поверни iPhone вертикально', this.w / 2, this.h / 2, 22, '#fff', 'center', '700'); return; }
+    if (this.state === 'menu') this.drawMenu();
+    else if (this.state === 'report') this.drawReport();
+    else { this.drawWorld(); this.drawHud(); if (this.paused) this.drawPause(); }
+    if (this.fade.a > 0) { c.setTransform(d, 0, 0, d, 0, 0); c.fillStyle = `rgba(0,0,0,${this.fade.a})`; c.fillRect(0, 0, this.w, this.h); }
+  }
+
+  vis(x, y, r) { const z = this.zoom; return x + r > this.cam.x - 10 && x - r < this.cam.x + this.w / z + 10 && y + r > this.cam.y - 10 && y - r < this.cam.y + this.h / z + 10; }
+
+  drawWorld() {
+    const c = this.c, L = this.level, z = this.zoom, d = this.dpr, p = this.player;
+    c.setTransform(d, 0, 0, d, 0, 0); c.fillStyle = '#07080c'; c.fillRect(0, 0, this.w, this.h);
+    if (!L.cache || L.cacheScale !== this.cacheScale) { L.cache = buildCache(L, this.cacheScale); L.cacheScale = this.cacheScale; }
+    c.setTransform(d * z, 0, 0, d * z, -this.cam.x * z * d, -this.cam.y * z * d);
+    c.imageSmoothingEnabled = true; c.imageSmoothingQuality = 'high';
+    c.drawImage(L.cache, 0, 0, L.w, L.h);
+    if (this.state === 'game') this.drawGameEntities(); else this.drawStationEntities();
+    this.drawLighting();
+    c.setTransform(d, 0, 0, d, 0, 0);
+    if (this.flash > 0) { c.fillStyle = `rgba(255,255,255,${this.flash * 0.9})`; c.fillRect(0, 0, this.w, this.h); }
+  }
+
+  drawStain(c, s) {
+    if (!this.vis(s.x, s.y, s.r + 20)) return;
+    const k = 0.5 + s.amt * 0.5, a = clamp(s.amt, 0.15, 1);
+    c.save(); c.translate(s.x, s.y);
+    if (s.surf === 'floor') {
+      c.fillStyle = `rgba(110,8,12,${0.85 * a})`; for (const b of s.blobs) { c.beginPath(); c.arc(b.dx * k, b.dy * k, b.r * k, 0, 7); c.fill(); }
+      c.fillStyle = `rgba(70,0,6,${0.6 * a})`; c.beginPath(); c.arc(0, 0, s.blobs[0].r * k * 0.55, 0, 7); c.fill();
+      c.fillStyle = `rgba(255,120,120,${0.22 * a})`; c.beginPath(); c.arc(-s.r * 0.18 * k, -s.r * 0.2 * k, s.r * 0.14 * k, 0, 7); c.fill();
+    } else if (s.surf === 'wall') {
+      c.fillStyle = `rgba(130,10,14,${0.9 * a})`; for (const b of s.blobs) { c.beginPath(); c.arc(b.dx * k * 0.8, b.dy * k * 0.8, b.r * k * 0.8, 0, 7); c.fill(); }
+      c.strokeStyle = `rgba(130,10,14,${0.9 * a})`; c.lineWidth = 2; c.lineCap = 'round';
+      for (const dr of s.drips) { c.beginPath(); c.moveTo(dr.dx * k, 0); c.lineTo(dr.dx * k, dr.len * k); c.stroke(); }
+      c.strokeStyle = 'rgba(255,255,255,0.35)'; c.lineWidth = 1; c.setLineDash([3, 3]); c.beginPath(); c.arc(0, 0, s.r * 1.05, 0, 7); c.stroke(); c.setLineDash([]);   // пунктир: «нужна губка»
+    } else {
+      c.fillStyle = `rgba(90,20,30,${0.55 * a})`; for (const b of s.blobs) { c.beginPath(); c.arc(b.dx * k, b.dy * k, b.r * k, 0, 7); c.fill(); }
+      c.strokeStyle = `rgba(255,230,120,${0.5 * a})`; c.lineWidth = 1.5; c.setLineDash([4, 3]); c.beginPath(); c.arc(0, 0, s.r * 1.15 * k, 0, 7); c.stroke(); c.setLineDash([]);
+    }
+    c.restore();
+  }
+
+  drawBodyShape(c, b) {
+    c.save(); c.translate(b.cx, b.cy); if (b.orient === 'v') c.rotate(Math.PI / 2);
+    if (b.bagged) {
+      c.fillStyle = 'rgba(0,0,0,0.3)'; rr(c, -26, -10, 54, 24, 10); c.fill();
+      c.fillStyle = '#8f949b'; rr(c, -27, -12, 54, 24, 10); c.fill(); c.strokeStyle = '#4a4e55'; c.lineWidth = 1.5; c.stroke();
+      c.strokeStyle = '#33363c'; c.lineWidth = 2; c.beginPath(); c.moveTo(-22, 0); c.lineTo(22, 0); c.stroke();
+      c.fillStyle = 'rgba(255,255,255,0.18)'; rr(c, -22, -9, 40, 4, 2); c.fill();
+    } else {
+      const l = b.look; c.fillStyle = 'rgba(0,0,0,0.3)'; rr(c, -26, -8, 54, 22, 8); c.fill();
+      c.fillStyle = l.pants; rr(c, 4, -8, 22, 16, 5); c.fill();                      // ноги
+      c.fillStyle = l.shirt; rr(c, -14, -11, 22, 22, 6); c.fill();                   // торс
+      c.fillStyle = '#d9a98a'; rr(c, -14, -15, 14, 5, 2); c.fill(); rr(c, -14, 10, 14, 5, 2); c.fill();   // руки
+      c.fillStyle = '#d9a98a'; c.beginPath(); c.arc(-20, 0, 8, 0, 7); c.fill();       // голова
+      c.fillStyle = l.hair; c.beginPath(); c.arc(-22, 0, 7, -1.7, 1.7, true); c.fill();
+      c.fillStyle = 'rgba(120,10,14,0.8)'; c.beginPath(); c.arc(-4, 2, 5, 0, 7); c.fill();
+      if (b.bagProgress > 0) { c.fillStyle = `rgba(143,148,155,${0.25 + b.bagProgress * 0.7})`; rr(c, -27, -12, 54, 24, 10); c.fill(); }   // мешок «натягивается»
+    }
+    c.restore();
+    if (b.bagProgress > 0 && !b.bagged) {                                              // прогресс-бар над телом
+      const bx = b.cx - 24, by = b.r.y - 16; c.fillStyle = 'rgba(0,0,0,0.7)'; rr(c, bx - 2, by - 2, 52, 11, 5); c.fill();
+      c.fillStyle = '#ffd24a'; rr(c, bx, by, 48 * b.bagProgress, 7, 3.5); c.fill();
+    }
+  }
+
+  drawRat(c, r) {
+    c.save(); c.translate(r.x, r.y); c.rotate(r.ang);
+    const w = Math.sin(r.anim) * 1.2;
+    c.strokeStyle = '#d99a9a'; c.lineWidth = 1.2; c.beginPath(); c.moveTo(-6, 0); c.quadraticCurveTo(-11, w * 2, -15, -w); c.stroke();
+    c.fillStyle = '#6b625a'; c.beginPath(); c.ellipse(0, 0, 7, 3.6, 0, 0, 7); c.fill();
+    c.fillStyle = '#7d726a'; c.beginPath(); c.ellipse(6, 0, 3.2, 2.3, 0, 0, 7); c.fill();
+    c.fillStyle = '#d99a9a'; c.beginPath(); c.arc(4.6, -2.3, 1.3, 0, 7); c.arc(4.6, 2.3, 1.3, 0, 7); c.fill();
+    c.fillStyle = '#e33'; c.beginPath(); c.arc(7.2, -0.9, 0.7, 0, 7); c.arc(7.2, 0.9, 0.7, 0, 7); c.fill();
+    c.restore();
+  }
+
+  drawBucket(c, x, y, B) {
+    c.fillStyle = 'rgba(0,0,0,0.3)'; c.beginPath(); c.ellipse(x + 2, y + 3, 8, 6, 0, 0, 7); c.fill();
+    c.fillStyle = '#7e8a96'; c.beginPath(); c.arc(x, y, 8, 0, 7); c.fill(); c.strokeStyle = '#3d4650'; c.lineWidth = 1.5; c.stroke();
+    if (B.water > 0.02) {                                                                  // цвет воды: голубая → бурая от грязи
+      const dr = clamp(B.dirt, 0, 1), col = `rgb(${Math.round(90 + dr * 90)},${Math.round(160 - dr * 70)},${Math.round(210 - dr * 150)})`;
+      c.fillStyle = col; c.beginPath(); c.arc(x, y, 6.2 * (0.55 + 0.45 * B.water), 0, 7); c.fill();
+      if (B.soap > 0.05) { c.fillStyle = 'rgba(255,255,255,0.7)'; c.beginPath(); c.arc(x - 2, y - 1, 1.6, 0, 7); c.arc(x + 2, y + 1.5, 1.2, 0, 7); c.fill(); }
+    } else { c.fillStyle = '#3a4048'; c.beginPath(); c.arc(x, y, 5.6, 0, 7); c.fill(); }
+    c.strokeStyle = '#ccd'; c.lineWidth = 1.2; c.beginPath(); c.arc(x, y, 8, -0.6, 0.6 + Math.PI, false); c.stroke();
+  }
+
+  drawPlayer(c) {
+    const p = this.player, tool = this.state === 'game' ? this.tool : 'hands', ang = p.angle, sw = p.moving || (p.stepDist > 0) ? Math.sin(p.walk) * 3 : 0;
+    c.save(); c.translate(p.x, p.y);
+    c.fillStyle = 'rgba(0,0,0,0.3)'; c.beginPath(); c.ellipse(1, 3, 10, 8, 0, 0, 7); c.fill();
+    c.rotate(ang);
+    // инструмент в руке (рисуем под телом)
+    const hold = this.actionHeld && this.act && this.act.kind === 'hold';
+    if (tool === 'mop' && this.state === 'game') {
+      const sw2 = hold ? Math.sin((this.mopSwing || 0)) * 4 : 0;
+      c.strokeStyle = '#a9824f'; c.lineWidth = 2.2; c.beginPath(); c.moveTo(4, 5); c.lineTo(26, sw2); c.stroke();
+      c.fillStyle = '#e4e4dc'; rr(c, 22, sw2 - 8, 8, 16, 3); c.fill(); c.strokeStyle = '#999'; c.lineWidth = 0.8; c.stroke();
+    } else if (tool === 'sponge' && this.state === 'game') {
+      const sw2 = hold ? Math.sin((this.mopSwing || 0)) * 3 : 0;
+      c.fillStyle = this.sponge.wet > 0.05 ? '#d9c13a' : '#b9a94a'; rr(c, 10, -4 + sw2, 12, 9, 2); c.fill(); c.fillStyle = '#4aa84a'; rr(c, 10, 1 + sw2, 12, 4, 2); c.fill();
+    } else if (tool === 'phone' && this.state === 'game') {
+      c.fillStyle = '#20242c'; rr(c, 9, -5, 12, 9, 2); c.fill(); c.fillStyle = '#6a9ad0'; rr(c, 11, -3.5, 8, 6, 1); c.fill();
+    } else if (tool === 'bag' && this.state === 'game' && this.bags > 0) {
+      c.fillStyle = '#9aa0a8'; rr(c, 8, -6, 12, 12, 4); c.fill(); c.strokeStyle = '#444'; c.lineWidth = 1; c.stroke();
+    }
+    // руки
+    c.fillStyle = '#222'; rr(c, 6 + sw * 0.5, -11, 9, 5, 2.5); c.fill(); rr(c, 6 - sw * 0.5, 6, 9, 5, 2.5); c.fill();
+    // тело (жёлтый комбинезон)
+    c.fillStyle = '#e0a31a'; rr(c, -7, -10, 14, 20, 6); c.fill(); c.strokeStyle = '#8a620a'; c.lineWidth = 1.2; c.stroke();
+    c.fillStyle = 'rgba(255,255,255,0.25)'; c.fillRect(-5, -2, 10, 3);
+    // голова + кепка
+    c.fillStyle = '#e8b894'; c.beginPath(); c.arc(1, 0, 6.2, 0, 7); c.fill();
+    c.fillStyle = '#1f2a3a'; c.beginPath(); c.arc(0, 0, 6.2, Math.PI * 0.6, Math.PI * 1.4); c.lineTo(5, -3); c.fill();
+    c.fillStyle = '#ffe9a0'; c.beginPath(); c.arc(7, 0, 1.6, 0, 7); c.fill();          // фонарик на лбу
+    c.restore();
+    // тело на плечах
+    if (this.carrying) {
+      c.save(); c.translate(p.x, p.y - 1); c.rotate(ang + Math.PI / 2);
+      c.fillStyle = '#8f949b'; rr(c, -27, -9, 54, 18, 9); c.fill(); c.strokeStyle = '#4a4e55'; c.lineWidth = 1.5; c.stroke();
+      c.strokeStyle = '#33363c'; c.lineWidth = 2; c.beginPath(); c.moveTo(-22, 0); c.lineTo(22, 0); c.stroke(); c.restore();
+    }
+  }
+
+  drawGameEntities() {
+    const c = this.c, p = this.player, L = this.level;
+    for (const s of this.stains) if (s.surf === 'floor') this.drawStain(c, s);
+    for (const s of this.stains) if (s.surf === 'wall') this.drawStain(c, s);
+    for (const b of this.bodies) if (!b.carried && !b.disposed && this.vis(b.cx, b.cy, 40)) this.drawBodyShape(c, b);
+    for (const s of this.stains) if (s.surf === 'ceil') this.drawStain(c, s);
+    for (const r of this.rats) if (this.vis(r.x, r.y, 20)) this.drawRat(c, r);
+    if (!this.bucket.carried || true) {
+      const B = this.bucket; const show = !B.carried || this.tool === 'bucket' || this.tool === 'mop' || this.tool === 'sponge';
+      if (show) this.drawBucket(c, B.x, B.y, B);
+    }
+    this.drawPlayer(c);
+    // Цель-стрелка
+    const o = this.obj; if (o && !o.done && dist(p.x, p.y, o.x, o.y) > 60) {
+      const a = Math.atan2(o.y - p.y, o.x - p.x), pulse = 1 + Math.sin(this.t * 5) * 0.12;
+      c.save(); c.translate(p.x + Math.cos(a) * 34, p.y + Math.sin(a) * 34); c.rotate(a); c.scale(pulse, pulse);
+      c.fillStyle = 'rgba(255,210,74,0.85)'; c.beginPath(); c.moveTo(7, 0); c.lineTo(-4, -6); c.lineTo(-1, 0); c.lineTo(-4, 6); c.closePath(); c.fill(); c.restore();
+    }
+    // Плавающая кнопка «сфотографировать» над ближайшим телом
+    this.photoBtn = null;
+    if (this.tool === 'phone' && !this.carrying) {
+      let nb = null, nd = 1e9; for (const b of this.bodies) { if (b.disposed || b.carried || b.photographed) continue; const d = rectDist(p.x, p.y, b.r); if (d < nd) { nd = d; nb = b; } }
+      if (nb && nd <= 80) {
+        const bx = nb.cx, by = nb.r.y - 26 - Math.sin(this.t * 5) * 2;
+        c.fillStyle = 'rgba(0,0,0,0.65)'; c.beginPath(); c.arc(bx, by, 15, 0, 7); c.fill(); c.strokeStyle = '#fff'; c.lineWidth = 2; c.stroke(); drawIcon(c, 'cam', bx, by, 9);
+        const z = this.zoom; this.photoBtn = { x: (bx - this.cam.x) * z, y: (by - this.cam.y) * z, r: 15 * z, body: nb };
+      }
+    }
+  }
+
+  drawStationEntities() {
+    const c = this.c, o = this.officer, p = this.player;
+    if (o) {
+      // конус зрения
+      const range = p.moving ? 150 : 70; c.save(); c.translate(o.x, o.y); c.rotate(o.ang);
+      const g = c.createRadialGradient(0, 0, 4, 0, 0, 150); g.addColorStop(0, 'rgba(255,240,150,0.35)'); g.addColorStop(1, 'rgba(255,240,150,0)');
+      c.fillStyle = g; c.beginPath(); c.moveTo(0, 0); c.arc(0, 0, 150, -0.72, 0.72); c.closePath(); c.fill();
+      c.strokeStyle = 'rgba(255,240,150,0.5)'; c.lineWidth = 1; c.setLineDash([4, 4]); c.beginPath(); c.arc(0, 0, range, -0.72, 0.72); c.stroke(); c.setLineDash([]);
+      // фигура
+      c.fillStyle = 'rgba(0,0,0,0.3)'; c.beginPath(); c.ellipse(1, 3, 10, 8, 0, 0, 7); c.fill();
+      c.fillStyle = '#2d4f9a'; rr(c, -7, -10, 14, 20, 6); c.fill(); c.fillStyle = '#e8b894'; c.beginPath(); c.arc(1, 0, 6, 0, 7); c.fill();
+      c.fillStyle = '#16213d'; c.beginPath(); c.arc(0, 0, 6.2, Math.PI * 0.55, Math.PI * 1.45); c.lineTo(6, 0); c.fill(); c.restore();
+      if (o.sus > 0.05) { c.fillStyle = 'rgba(0,0,0,0.7)'; rr(c, o.x - 16, o.y - 26, 32, 8, 4); c.fill(); c.fillStyle = o.sus > 0.7 ? '#ff4a4a' : '#ffd24a'; rr(c, o.x - 15, o.y - 25, 30 * Math.min(1, o.sus), 6, 3); c.fill(); this.txt('!', o.x, o.y - 30, 14, '#ff4a4a', 'center', '800'); }
+    }
+    this.drawPlayer(c);
+    const obj = this.obj; if (obj && dist(p.x, p.y, obj.x, obj.y) > 50) {
+      const a = Math.atan2(obj.y - p.y, obj.x - p.x); c.save(); c.translate(p.x + Math.cos(a) * 30, p.y + Math.sin(a) * 30); c.rotate(a);
+      c.fillStyle = 'rgba(255,210,74,0.85)'; c.beginPath(); c.moveTo(7, 0); c.lineTo(-4, -6); c.lineTo(-1, 0); c.lineTo(-4, 6); c.closePath(); c.fill(); c.restore();
+    }
+    // мерцание терминала
+    const T = this.level.terminal; if (T) { c.fillStyle = `rgba(80,255,140,${0.12 + Math.sin(this.t * 6) * 0.04})`; c.fillRect(T.x + 14, T.y + 6, T.w - 28, 26); }
+    // табличка «ВЫХОД»
+    const E = this.level.exitZone; c.fillStyle = 'rgba(80,255,140,0.18)'; c.fillRect(E.x, E.y, E.w, E.h); this.txt('ВЫХОД', E.x + E.w / 2, E.y + 18, 12, '#9cff9c', 'center', '800');
+  }
+
+  /* Освещение: затемнение комнат + «фонарик» вырезается градиентом (маска видимости) */
+  drawLighting() {
+    const L = this.level, lc = this.lctx, c = this.c, p = this.player, z = this.zoom, d = this.dpr;
+    const s = this.light.width / this.w;
+    lc.setTransform(1, 0, 0, 1, 0, 0); lc.globalCompositeOperation = 'source-over'; lc.clearRect(0, 0, this.light.width, this.light.height);
+    lc.setTransform(s * z, 0, 0, s * z, -this.cam.x * z * s, -this.cam.y * z * s);
+    for (const r of L.rooms) if (r.dark > 0) { lc.fillStyle = `rgba(3,4,9,${r.dark})`; lc.fillRect(r.x - 8, r.y - 8, r.w + 16, r.h + 16); }
+    lc.globalCompositeOperation = 'destination-out';
+    const fx = p.x + p.fx * 34, fy = p.y + p.fy * 34;
+    let g = lc.createRadialGradient(fx, fy, 6, fx, fy, 170); g.addColorStop(0, 'rgba(0,0,0,1)'); g.addColorStop(0.55, 'rgba(0,0,0,0.92)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+    lc.fillStyle = g; lc.beginPath(); lc.arc(fx, fy, 170, 0, 7); lc.fill();
+    g = lc.createRadialGradient(p.x, p.y, 4, p.x, p.y, 62); g.addColorStop(0, 'rgba(0,0,0,1)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+    lc.fillStyle = g; lc.beginPath(); lc.arc(p.x, p.y, 62, 0, 7); lc.fill();
+    lc.globalCompositeOperation = 'source-over';
+    c.setTransform(d, 0, 0, d, 0, 0); c.imageSmoothingEnabled = true; c.drawImage(this.light, 0, 0, this.w, this.h);
+  }
+
+  /* ---------- HUD ---------- */
+  clockStr() {
+    const mins = Math.floor(this.time / SHIFT_SECONDS * 480), t = (22 * 60 + mins) % 1440;
+    return String(Math.floor(t / 60)).padStart(2, '0') + ':' + String(t % 60).padStart(2, '0');
+  }
+  remainingStain() { return this.stains.reduce((a, b) => a + b.amt, 0); }
+
+  drawHud() {
+    const c = this.c, S = this.safe, isGame = this.state === 'game', w = this.w, h = this.h;
+    c.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    // пауза-кнопка
+    const pb = this.pauseBtn; c.fillStyle = 'rgba(10,12,18,0.72)'; c.beginPath(); c.arc(pb.x, pb.y, pb.r, 0, 7); c.fill();
+    c.fillStyle = '#fff'; c.fillRect(pb.x - 6, pb.y - 7, 4, 14); c.fillRect(pb.x + 2, pb.y - 7, 4, 14);
+    // верхняя левая панель
+    if (isGame) {
+      const left = this.bodies.filter(b => !b.disposed).length, pct = this.stats.stainTotal ? Math.round((1 - this.remainingStain() / this.stats.stainTotal) * 100) : 100;
+      this.panel(10, S.t + 10, 128, 62);
+      this.txt(this.clockStr(), 20, S.t + 36, 22, this.shiftOver ? '#ff6a6a' : '#fff', 'left', '800');
+      this.txt('Смена ' + this.day, 92, S.t + 31, 11, '#9aa', 'left', '600');
+      this.bar(20, S.t + 43, 108, 5, this.time / SHIFT_SECONDS, '#ffd24a');
+      this.txt('Тела ' + (this.bodies.length - left) + '/' + this.bodies.length + ' · Чисто ' + clamp(pct, 0, 100) + '%', 20, S.t + 64, 11, '#cfd6e0', 'left', '600');
+    } else {
+      this.panel(10, S.t + 10, 128, 40);
+      this.txt('УЧАСТОК', 20, S.t + 35, 16, '#9ad0ff', 'left', '800');
+    }
+    // список жертв
+    if (this.victims.length) {
+      const top = S.t + (isGame ? 80 : 58), lh = 15, hh = 22 + this.victims.length * lh;
+      this.panel(10, top, 138, hh);
+      this.txt('Жертвы (' + this.victims.length + ')', 20, top + 16, 11, '#9ad0ff', 'left', '700');
+      this.victims.forEach((v, i) => {
+        const y = top + 32 + i * lh; this.txt((v.deleted ? '✓ ' : '• ') + v.name, 20, y, 12, v.deleted ? '#7fe07f' : '#fff', 'left', '600');
+        if (!v.deleted && v.progress > 0) this.bar(100, y - 8, 40, 5, v.progress, '#9cff9c');
+      });
+    }
+    // кнопка «Закончить смену»
+    if (isGame && (this.obj && this.obj.done || this.shiftOver)) {
+      const bw = 140, bx = w / 2 - bw / 2 + 20, by = S.t + 14, pulse = 1 + Math.sin(this.t * 6) * 0.03;
+      c.save(); c.translate(bx + bw / 2, by + 20); c.scale(pulse, pulse); c.translate(-bx - bw / 2, -by - 20); this.btn('endshift', 'Закончить ▸', bx, by, bw, 40, true); c.restore();
+    }
+    // тосты
+    this.toasts.forEach((t, i) => {
+      const y = S.t + 140 + i * 30 + (isGame ? 0 : -20); c.globalAlpha = Math.min(1, t.t * 2);
+      c.font = `600 13px ${FONT}`; const tw = Math.min(w - 20, c.measureText(t.msg).width + 22);
+      this.panel(w / 2 - tw / 2, y - 17, tw, 26, 'rgba(10,12,18,0.82)', 13); this.txt(t.msg, w / 2, y + 1, 13, t.col, 'center', '600'); c.globalAlpha = 1;
+    });
+    // подсказка внизу
+    const invY = this.invY;
+    if (this.hintText) {
+      c.font = `600 13px ${FONT}`; const tw = Math.min(w - 20, c.measureText(this.hintText).width + 24);
+      this.panel(w / 2 - tw / 2, invY - 26, tw, 22, 'rgba(10,12,18,0.78)', 11); this.txt(this.hintText, w / 2, invY - 10, 13, '#ffe9a0', 'center', '600');
+    }
+    if (isGame) this.drawBucketPanel();
+    if (isGame) this.drawInventory();
+    this.drawJoystick(); this.drawActionButton();
+  }
+
+  drawBucketPanel() {
+    const B = this.bucket, S = this.sponge, y = this.invY - 100; this.panel(10, y, 112, 66);
+    this.txt('Ведро' + (B.carried ? '' : ' (на полу)'), 18, y + 15, 11, '#9ad0ff', 'left', '700');
+    this.txt('Вода', 18, y + 31, 10, '#cfd6e0', 'left', '600'); this.bar(52, y + 24, 62, 6, B.water, '#4aa8ff');
+    this.txt('Грязь', 18, y + 44, 10, '#cfd6e0', 'left', '600'); this.bar(52, y + 37, 62, 6, B.dirt, B.dirt > 0.85 ? '#b04a2a' : '#8a6a3a');
+    this.txt('Средство', 18, y + 57, 10, '#cfd6e0', 'left', '600'); this.bar(70, y + 50, 44, 6, B.soap / 1.6, '#7fe07f');
+  }
+
+  drawInventory() {
+    const c = this.c, w = this.w, y = this.invY, sw = w / TOOLS.length, o = this.obj;
+    c.fillStyle = 'rgba(8,10,15,0.94)'; c.fillRect(0, y, w, this.invH); c.fillStyle = 'rgba(255,255,255,0.1)'; c.fillRect(0, y, w, 1);
+    TOOLS.forEach((t, i) => {
+      const cx = i * sw + sw / 2, cy = y + 28, sel = this.tool === t.id;
+      if (sel) { c.fillStyle = 'rgba(224,163,26,0.22)'; rr(c, i * sw + 4, y + 5, sw - 8, 56, 12); c.fill(); c.strokeStyle = '#e0a31a'; c.lineWidth = 2; c.stroke(); }
+      else if (o && o.tool === t.id) { const a = 0.35 + Math.sin(this.t * 6) * 0.25; c.strokeStyle = `rgba(255,210,74,${a})`; c.lineWidth = 2; rr(c, i * sw + 4, y + 5, sw - 8, 56, 12); c.stroke(); }
+      drawIcon(c, t.id, cx, cy, 15);
+      this.txt(t.name, cx, y + 56, 10, sel ? '#ffd47a' : '#aab', 'center', '700');
+      if (t.id === 'bag') { c.fillStyle = '#c33'; c.beginPath(); c.arc(cx + 14, y + 12, 8, 0, 7); c.fill(); this.txt(String(this.bags), cx + 14, y + 16, 11, '#fff', 'center', '800'); }
+      if (t.id === 'bucket') this.bar(i * sw + 14, y + 8, sw - 28, 3, this.bucket.water, '#4aa8ff');
+      if (t.id === 'sponge') this.bar(i * sw + 14, y + 8, sw - 28, 3, this.sponge.wet, '#e6c93a');
+    });
+  }
+
+  drawJoystick() {
+    const j = this.joy, c = this.c; if (!j.active) return;
+    c.fillStyle = 'rgba(255,255,255,0.08)'; c.strokeStyle = 'rgba(255,255,255,0.35)'; c.lineWidth = 2; c.beginPath(); c.arc(j.bx, j.by, 46, 0, 7); c.fill(); c.stroke();
+    c.fillStyle = 'rgba(255,255,255,0.4)'; const dx = j.x - j.bx, dy = j.y - j.by, m = Math.hypot(dx, dy) || 1, k = Math.min(m, 46) / m;
+    c.beginPath(); c.arc(j.bx + dx * k, j.by + dy * k, 22, 0, 7); c.fill();
+  }
+
+  drawActionButton() {
+    const c = this.c, b = this.actBtn, a = this.act || { kind: 'none' }, active = a.kind !== 'none', held = this.actionHeld && a.kind === 'hold';
+    c.globalAlpha = active ? 1 : 0.4;
+    c.fillStyle = held ? '#b8861c' : (active ? '#e0a31a' : '#555'); c.beginPath(); c.arc(b.x, b.y, b.r, 0, 7); c.fill();
+    c.strokeStyle = active ? '#ffd47a' : '#888'; c.lineWidth = 3; c.stroke();
+    if (a.icon) { drawIcon(c, a.icon, b.x, b.y - 4, 12); this.txt(a.label, b.x, b.y + 28, 11, '#1a1206', 'center', '800'); }
+    else this.txt(a.label || '•', b.x, b.y + 5, a.small || (a.label && a.label.length > 7) ? 11 : 15, '#1a1206', 'center', '800');
+    // прогресс удержания (упаковка / удаление записи)
+    let prog = 0; if (a.kind === 'hold') { const bd = this.bodies.find(x => x.bagProgress > 0); prog = this.state === 'station' ? (this.victims.find(v => v.progress > 0) || { progress: 0 }).progress : (bd ? bd.bagProgress : 0); }
+    if (prog > 0) { c.strokeStyle = '#fff'; c.lineWidth = 5; c.beginPath(); c.arc(b.x, b.y, b.r + 6, -Math.PI / 2, -Math.PI / 2 + prog * 6.283); c.stroke(); }
+    c.globalAlpha = 1;
+  }
+
+  drawPause() {
+    const c = this.c, w = this.w, h = this.h; c.fillStyle = 'rgba(0,0,0,0.7)'; c.fillRect(0, 0, w, h);
+    this.txt('Пауза', w / 2, h * 0.28, 34, '#fff', 'center', '800');
+    const bw = Math.min(280, w - 60), bx = w / 2 - bw / 2; let y = h * 0.34;
+    this.btn('resume', 'Продолжить', bx, y, bw, 52, true); y += 64;
+    if (this.state === 'game') { this.btn('finish', 'Закончить смену → участок', bx, y, bw, 52); y += 64; }
+    this.btn('sound', Save.data.muted ? 'Звук: выкл' : 'Звук: вкл', bx, y, bw, 52); y += 64;
+    this.btn('menu', 'В главное меню', bx, y, bw, 52);
+  }
+
+  drawMenu() {
+    const c = this.c, w = this.w, h = this.h, D = Save.data;
+    const g = c.createLinearGradient(0, 0, 0, h); g.addColorStop(0, '#1a0b10'); g.addColorStop(1, '#07080c'); c.fillStyle = g; c.fillRect(0, 0, w, h);
+    for (let i = 0; i < 14; i++) {                                                     // капли, медленно стекающие вниз
+      const x = (i * 97 + 30) % w, y = ((this.t * (14 + i * 3) + i * 120) % (h + 60)) - 30;
+      c.fillStyle = `rgba(150,15,25,${0.25 + (i % 3) * 0.15})`; c.beginPath(); c.arc(x, y, 3 + i % 4, 0, 7); c.fill(); c.fillRect(x - 1, y - 24, 2, 24);
+    }
+    this.txt('УБОРЩИК', w / 2, h * 0.22, Math.min(54, w / 7.5), '#f2e6d8', 'center', '900');
+    this.txt('служба очистки места происшествия', w / 2, h * 0.22 + 26, 14, '#b88', 'center', '600');
+    const bw = Math.min(290, w - 60), bx = w / 2 - bw / 2; let y = h * 0.34;
+    if (this.showHelp) { this.drawHelp(y); y = h - 140; this.btn('help', 'Назад', bx, y, bw, 52, true); return; }
+    this.txt('Деньги: $' + D.money + '  ·  Рекорд: $' + D.best + '  ·  Смена ' + (D.day || 1), w / 2, y - 12, 13, '#cdb', 'center', '600');
+    if (D.shift) { this.btn('continue', 'Продолжить смену ' + D.shift.day, bx, y, bw, 56, true); y += 68; this.btn('new', 'Новая смена ' + (D.day || 1), bx, y, bw, 52); }
+    else { this.btn('new', 'Начать смену ' + (D.day || 1), bx, y, bw, 56, true); }
+    y += 68; this.btn('help', 'Как играть', bx, y, bw, 52); y += 64; this.btn('sound', D.muted ? 'Звук: выкл' : 'Звук: вкл', bx, y, bw, 52);
+    this.txt('Для лучшего опыта: Поделиться → На экран «Домой»', w / 2, h - 28 - this.safe.b, 11, '#778', 'center', '600');
+  }
+
+  drawHelp(y) {
+    const w = this.w, lines = [
+      ['Левый палец', 'джойстик (появляется там, где коснулся)'],
+      ['Жёлтая кнопка', 'контекстное действие; для упаковки, мытья и удаления — держи'],
+      ['Нижняя панель', 'выбор инструмента'],
+      ['1. Телефон', 'подойди к телу → «Снять» (запишет жертву)'],
+      ['2. Мешок', 'возьми со стопки; тело держи 3 сек (кнопкой или пальцем по телу)'],
+      ['3. Руки', 'сними с кровати, возьми упакованное тело, неси к машине'],
+      ['4. Ведро', 'набери воду у раковины, добавь средство из бутылки'],
+      ['5. Швабра / Губка', 'пол — шваброй, стены и потолок — губкой'],
+      ['6. Участок', 'после смены удали записи жертв, не попавшись полицейскому']
+    ];
+    this.panel(14, y - 4, w - 28, lines.length * 46 + 8, 'rgba(10,12,18,0.7)', 14);
+    lines.forEach((l, i) => { const yy = y + 20 + i * 46; this.txt(l[0], 28, yy, 14, '#ffd47a', 'left', '800'); this.txt(l[1], 28, yy + 18, 12, '#dde', 'left', '500', w - 56); });
+  }
+
+  drawReport() {
+    const c = this.c, w = this.w, h = this.h, r = this.report; if (!r) return;
+    const g = c.createLinearGradient(0, 0, 0, h); g.addColorStop(0, '#0e1420'); g.addColorStop(1, '#07080c'); c.fillStyle = g; c.fillRect(0, 0, w, h);
+    this.txt('Конец смены ' + r.day, w / 2, this.safe.t + 60, 30, '#fff', 'center', '800');
+    let stars = ''; for (let i = 0; i < 5; i++) stars += i < r.stars ? '★' : '☆'; this.txt(stars, w / 2, this.safe.t + 100, 32, '#ffd24a', 'center', '700');
+    const px = 18, pw = w - 36, ph = r.lines.length * 30 + 20, py = this.safe.t + 120; this.panel(px, py, pw, ph, 'rgba(255,255,255,0.07)', 14);
+    r.lines.forEach((l, i) => { const y = py + 32 + i * 30; this.txt(l[0], px + 14, y, 14, '#dde', 'left', '600'); if (l[1] !== 0) this.txt((l[1] > 0 ? '+' : '') + l[1] + ' $', px + pw - 14, y, 14, l[1] > 0 ? '#7fe07f' : '#ff8a7a', 'right', '700'); });
+    const ty = py + ph + 44; this.txt('Заработано: $' + r.pay, w / 2, ty, 28, '#ffd47a', 'center', '800'); this.txt('Всего денег: $' + Save.data.money, w / 2, ty + 26, 14, '#aab', 'center', '600');
+    const bw = Math.min(290, w - 60), bx = w / 2 - bw / 2; this.btn('next', 'Следующая смена', bx, h - 150 - this.safe.b, bw, 54, true); this.btn('menu', 'В главное меню', bx, h - 86 - this.safe.b, bw, 50);
+  }
+
+  /* ---------- главный цикл ---------- */
+  frame(now) {
+    const dt = Math.min(0.05, Math.max(0.001, (now - (this.last || now)) / 1000)); this.last = now;
+    this.update(dt); this.draw();
+  }
+}
+
+/* ---------------------------------------------------------------- ЗАПУСК */
+function boot() {
+  const canvas = document.getElementById('game'), game = new Game(canvas); window.__game = game;
+  const loop = now => { game.frame(now); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+  // PWA: офлайн-режим (service worker работает только по https или localhost)
+  if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) navigator.serviceWorker.register('sw.js').catch(() => { });
+}
+boot();
+
+})();
+</script>
+</body>
+</html>
